@@ -1,0 +1,528 @@
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import Optional
+
+from app.database import get_db
+from app.models import (
+    Product, ProductLine, Project, ProjectHistory, Tag, TagGroup,
+    CustomField, Department, Person, CustomFieldType,
+    Patent,
+    User,
+)
+from app.schemas.schemas import (
+    Product as ProductSchema, ProductCreate, ProductUpdate,
+    Project as ProjectSchema, ProjectCreate, ProjectUpdate,
+    Tag as TagSchema, TagCreate, TagUpdate,
+    TagGroup as TagGroupSchema, TagGroupCreate, TagGroupUpdate,
+    CustomField as CustomFieldSchema, CustomFieldCreate, CustomFieldUpdate,
+    Department as DepartmentSchema, DepartmentCreate, DepartmentUpdate,
+    Person as PersonSchema, PersonCreate, PersonUpdate,
+    ProductLine as ProductLineSchema, ProductLineCreate, ProductLineUpdate,
+)
+from app.services.formula_engine import FormulaError
+from app.services.formula_service import FormulaService
+from app.core.exceptions import BadRequestException, NotFoundException
+
+router = APIRouter(tags=["meta"])
+
+
+@router.get("/products", response_model=list[ProductSchema])
+def list_products(
+    active_only: bool = False,
+    database_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    列出产品分类。
+
+    打通产品分类与库（Database）的关联关系：
+    - 若指定 database_id，则 patent_count 返回该库下各产品的专利数；
+    - 否则 patent_count 返回跨所有库的专利总数。
+    - 产品本身仍是全局实体，不绑定到任何库，关联通过 Patent.product_id + Patent.database_id 体现。
+    """
+    query = db.query(Product)
+    if active_only:
+        query = query.filter(Product.is_active == True)
+    products = query.order_by(Product.name).all()
+
+    # 用一条聚合 SQL 一次性拿到所有 Product 的专利计数，避免 N+1
+    count_query = db.query(
+        Patent.product_id,
+        func.count(Patent.id).label("cnt"),
+    ).filter(Patent.product_id.isnot(None))
+    if database_id is not None:
+        from app.services.patent_database_scope import in_database
+        count_query = count_query.filter(in_database(database_id))
+    count_map = {pid: cnt for pid, cnt in count_query.group_by(Patent.product_id).all()}
+
+    for p in products:
+        p.patent_count = count_map.get(p.id, 0)
+    return products
+
+
+@router.post("/products", response_model=ProductSchema)
+def create_product(product_in: ProductCreate, db: Session = Depends(get_db)):
+    values = product_in.model_dump()
+    if values.get("owner_user_id") is not None and not db.query(User.id).filter(User.id == values["owner_user_id"], User.is_active == True).first():
+        raise BadRequestException("产品负责人账号不存在或已停用")
+    product = Product(**values)
+    db.add(product)
+    db.commit()
+    db.refresh(product)
+    return product
+
+
+@router.put("/products/{product_id}", response_model=ProductSchema)
+def update_product(product_id: int, product_in: ProductUpdate, db: Session = Depends(get_db)):
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        raise NotFoundException("Product not found")
+    values = product_in.model_dump(exclude_unset=True)
+    if values.get("owner_user_id") is not None and not db.query(User.id).filter(User.id == values["owner_user_id"], User.is_active == True).first():
+        raise BadRequestException("产品负责人账号不存在或已停用")
+    for field, value in values.items():
+        setattr(product, field, value)
+    db.commit()
+    db.refresh(product)
+    return product
+
+
+@router.delete("/products/{product_id}")
+def delete_product(product_id: int, db: Session = Depends(get_db)):
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        raise NotFoundException("Product not found")
+    db.delete(product)
+    db.commit()
+    return {"success": True}
+
+
+@router.get("/projects", response_model=list[ProjectSchema])
+def list_projects(
+    product_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(Project)
+    if product_id:
+        query = query.filter(Project.product_id == product_id)
+    projects = query.order_by(Project.name).all()
+    for p in projects:
+        p.patent_count = len(p.patents)
+    return projects
+
+
+PROJECT_HISTORY_FIELDS = (
+    "name", "code", "product_id", "product_category", "department_ids",
+    "product_line_ids",
+    "project_level", "project_type", "brands", "project_manager",
+    "research_owner", "shipping_regions", "current_stage", "product_model",
+    "description", "module", "start_date", "end_date", "status",
+)
+
+
+def _project_value(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def _project_snapshot(project: Project) -> dict:
+    return {field: _project_value(getattr(project, field)) for field in PROJECT_HISTORY_FIELDS}
+
+
+def _record_project_history(db: Session, project: Project, before: dict | None, action: str):
+    after = _project_snapshot(project)
+    changes = {
+        field: {"before": before.get(field) if before else None, "after": value}
+        for field, value in after.items()
+        if before is None or before.get(field) != value
+    }
+    if changes:
+        db.add(ProjectHistory(
+            project_id=project.id,
+            action=action,
+            changed_by="local-user",
+            changes=changes,
+            snapshot=after,
+        ))
+
+
+def _validate_project_departments(db: Session, department_ids: list[int] | None):
+    ids = list(dict.fromkeys(int(item) for item in (department_ids or [])))
+    if ids and db.query(Department.id).filter(Department.id.in_(ids)).count() != len(ids):
+        raise BadRequestException("所属部门包含不存在的部门")
+    return ids
+
+
+def _validate_project_product_lines(db: Session, product_line_ids: list[int] | None):
+    ids = list(dict.fromkeys(int(item) for item in (product_line_ids or [])))
+    if ids and db.query(ProductLine.id).filter(ProductLine.id.in_(ids)).count() != len(ids):
+        raise BadRequestException("所属产品线包含不存在的产品线")
+    return ids
+
+
+@router.get("/projects/{project_id}", response_model=ProjectSchema)
+def get_project(project_id: int, db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise NotFoundException("Project not found")
+    project.patent_count = len(project.patents)
+    return project
+
+
+@router.post("/projects", response_model=ProjectSchema)
+def create_project(project_in: ProjectCreate, db: Session = Depends(get_db)):
+    values = project_in.model_dump(exclude={"project_no"})
+    values["code"] = project_in.project_no if project_in.project_no is not None else project_in.code
+    values["department_ids"] = _validate_project_departments(db, values.get("department_ids"))
+    values["product_line_ids"] = _validate_project_product_lines(db, values.get("product_line_ids"))
+    project = Project(**values)
+    db.add(project)
+    db.flush()
+    _record_project_history(db, project, None, "created")
+    db.commit()
+    db.refresh(project)
+    project.patent_count = len(project.patents)
+    return project
+
+
+@router.put("/projects/{project_id}", response_model=ProjectSchema)
+def update_project(project_id: int, project_in: ProjectUpdate, db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise NotFoundException("Project not found")
+    before = _project_snapshot(project)
+    values = project_in.model_dump(exclude_unset=True, exclude={"project_no"})
+    payload = project_in.model_dump(exclude_unset=True)
+    if "project_no" in payload:
+        values["code"] = payload["project_no"]
+    if "department_ids" in values:
+        values["department_ids"] = _validate_project_departments(db, values["department_ids"])
+    if "product_line_ids" in values:
+        values["product_line_ids"] = _validate_project_product_lines(db, values["product_line_ids"])
+    for field, value in values.items():
+        setattr(project, field, value)
+    db.flush()
+    _record_project_history(db, project, before, "updated")
+    db.commit()
+    db.refresh(project)
+    project.patent_count = len(project.patents)
+    return project
+
+
+@router.get("/projects/{project_id}/history")
+def list_project_history(project_id: int, db: Session = Depends(get_db)):
+    if not db.query(Project.id).filter(Project.id == project_id).first():
+        raise NotFoundException("Project not found")
+    rows = db.query(ProjectHistory).filter(
+        ProjectHistory.project_id == project_id,
+    ).order_by(ProjectHistory.id.desc()).all()
+    return [{
+        "id": row.id,
+        "action": row.action,
+        "changed_by": row.changed_by,
+        "changes": row.changes or {},
+        "snapshot": row.snapshot or {},
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    } for row in rows]
+
+
+@router.delete("/projects/{project_id}")
+def delete_project(project_id: int, db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise NotFoundException("Project not found")
+    from app.config import settings
+    from app.models import ProjectAttachment
+    attachments = db.query(ProjectAttachment).filter(ProjectAttachment.project_id == project_id).all()
+    paths = [(settings.FILES_DIR / attachment.file_path).resolve() for attachment in attachments]
+    root = (settings.FILES_DIR / "attachments").resolve()
+    db.delete(project)
+    db.commit()
+    for path in paths:
+        if path.is_relative_to(root) and path.exists():
+            path.unlink()
+    return {"success": True}
+
+
+@router.get("/tags", response_model=list[TagSchema])
+def list_tags(db: Session = Depends(get_db)):
+    return db.query(Tag).order_by(Tag.name).all()
+
+
+@router.post("/tags", response_model=TagSchema)
+def create_tag(tag_in: TagCreate, db: Session = Depends(get_db)):
+    tag = Tag(**tag_in.model_dump())
+    db.add(tag)
+    db.commit()
+    db.refresh(tag)
+    return tag
+
+
+@router.put("/tags/{tag_id}", response_model=TagSchema)
+def update_tag(tag_id: int, tag_in: TagUpdate, db: Session = Depends(get_db)):
+    tag = db.query(Tag).filter(Tag.id == tag_id).first()
+    if not tag:
+        raise NotFoundException("Tag not found")
+    for field, value in tag_in.model_dump(exclude_unset=True).items():
+        setattr(tag, field, value)
+    db.commit()
+    db.refresh(tag)
+    return tag
+
+
+@router.delete("/tags/{tag_id}")
+def delete_tag(tag_id: int, db: Session = Depends(get_db)):
+    tag = db.query(Tag).filter(Tag.id == tag_id).first()
+    if not tag:
+        raise NotFoundException("Tag not found")
+    db.delete(tag)
+    db.commit()
+    return {"success": True}
+
+
+@router.get("/tag-groups", response_model=list[TagGroupSchema])
+def list_tag_groups(db: Session = Depends(get_db)):
+    return db.query(TagGroup).order_by(TagGroup.name).all()
+
+
+@router.post("/tag-groups", response_model=TagGroupSchema)
+def create_tag_group(group_in: TagGroupCreate, db: Session = Depends(get_db)):
+    group = TagGroup(**group_in.model_dump())
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+    return group
+
+
+@router.put("/tag-groups/{group_id}", response_model=TagGroupSchema)
+def update_tag_group(group_id: int, group_in: TagGroupUpdate, db: Session = Depends(get_db)):
+    group = db.query(TagGroup).filter(TagGroup.id == group_id).first()
+    if not group:
+        raise NotFoundException("Tag group not found")
+    for field, value in group_in.model_dump(exclude_unset=True).items():
+        setattr(group, field, value)
+    db.commit()
+    db.refresh(group)
+    return group
+
+
+@router.delete("/tag-groups/{group_id}")
+def delete_tag_group(group_id: int, db: Session = Depends(get_db)):
+    group = db.query(TagGroup).filter(TagGroup.id == group_id).first()
+    if not group:
+        raise NotFoundException("Tag group not found")
+    db.delete(group)
+    db.commit()
+    return {"success": True}
+
+
+@router.get("/custom-fields", response_model=list[CustomFieldSchema])
+def list_custom_fields(
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+):
+    query = db.query(CustomField)
+    if active_only:
+        query = query.filter(CustomField.is_active == True)
+    return query.order_by(CustomField.sort_order, CustomField.name).all()
+
+
+@router.post("/custom-fields", response_model=CustomFieldSchema)
+def create_custom_field(field_in: CustomFieldCreate, db: Session = Depends(get_db)):
+    data = field_in.model_dump()
+    if data.get("field_type") == CustomFieldType.FORMULA.value:
+        config = data.pop("formula_config", None) or {}
+        try:
+            return FormulaService.create_formula_field(
+                db,
+                key=data["key"],
+                name=data["name"],
+                expression=config.get("expression", ""),
+                return_type=config.get("return_type", "text"),
+                group_name=data.get("group_name") or "公式",
+                description=data.get("description"),
+                sort_order=data.get("sort_order") or 0,
+                is_active=data.get("is_active", True),
+            )
+        except FormulaError as exc:
+            raise BadRequestException(str(exc)) from exc
+    field = CustomField(**data)
+    db.add(field)
+    db.commit()
+    db.refresh(field)
+    return field
+
+
+@router.put("/custom-fields/{field_id}", response_model=CustomFieldSchema)
+def update_custom_field(field_id: int, field_in: CustomFieldUpdate, db: Session = Depends(get_db)):
+    field = db.query(CustomField).filter(CustomField.id == field_id).first()
+    if not field:
+        raise NotFoundException("Field not found")
+    updates = field_in.model_dump(exclude_unset=True)
+    target_type = updates.get("field_type")
+    current_type = field.field_type.value if hasattr(field.field_type, "value") else str(field.field_type)
+    if target_type == CustomFieldType.FORMULA.value or current_type == CustomFieldType.FORMULA.value:
+        if target_type and target_type != CustomFieldType.FORMULA.value:
+            FormulaService.remove_formula_dependencies(db, field.key)
+            field.formula_config = None
+            updates.pop("formula_config", None)
+            for field_name, value in updates.items():
+                setattr(field, field_name, value)
+            db.commit()
+            db.refresh(field)
+            return field
+        updates.pop("field_type", None)
+        try:
+            return FormulaService.update_formula_field(db, field, updates)
+        except FormulaError as exc:
+            raise BadRequestException(str(exc)) from exc
+    for field_name, value in updates.items():
+        setattr(field, field_name, value)
+    db.commit()
+    db.refresh(field)
+    return field
+
+
+@router.delete("/custom-fields/{field_id}")
+def delete_custom_field(field_id: int, db: Session = Depends(get_db)):
+    field = db.query(CustomField).filter(CustomField.id == field_id).first()
+    if not field:
+        raise NotFoundException("Field not found")
+    if field.field_type == CustomFieldType.FORMULA:
+        FormulaService.delete_formula_field(db, field)
+    else:
+        db.delete(field)
+        db.commit()
+    return {"success": True}
+
+
+@router.get("/departments", response_model=list[DepartmentSchema])
+def list_departments(db: Session = Depends(get_db)):
+    return db.query(Department).order_by(Department.name).all()
+
+
+@router.post("/departments", response_model=DepartmentSchema)
+def create_department(dept_in: DepartmentCreate, db: Session = Depends(get_db)):
+    dept = Department(**dept_in.model_dump())
+    db.add(dept)
+    db.commit()
+    db.refresh(dept)
+    return dept
+
+
+@router.put("/departments/{department_id}", response_model=DepartmentSchema)
+def update_department(department_id: int, dept_in: DepartmentUpdate, db: Session = Depends(get_db)):
+    dept = db.query(Department).filter(Department.id == department_id).first()
+    if not dept:
+        raise NotFoundException("Department not found")
+    for field, value in dept_in.model_dump(exclude_unset=True).items():
+        setattr(dept, field, value)
+    db.commit()
+    db.refresh(dept)
+    return dept
+
+
+@router.delete("/departments/{department_id}")
+def delete_department(department_id: int, db: Session = Depends(get_db)):
+    dept = db.query(Department).filter(Department.id == department_id).first()
+    if not dept:
+        raise NotFoundException("Department not found")
+    db.delete(dept)
+    db.commit()
+    return {"success": True}
+
+
+@router.get("/people", response_model=list[PersonSchema])
+def list_people(db: Session = Depends(get_db)):
+    return db.query(Person).order_by(Person.name).all()
+
+
+@router.post("/people", response_model=PersonSchema)
+def create_person(person_in: PersonCreate, db: Session = Depends(get_db)):
+    person = Person(**person_in.model_dump())
+    db.add(person)
+    db.commit()
+    db.refresh(person)
+    return person
+
+
+@router.put("/people/{person_id}", response_model=PersonSchema)
+def update_person(person_id: int, person_in: PersonUpdate, db: Session = Depends(get_db)):
+    person = db.query(Person).filter(Person.id == person_id).first()
+    if not person:
+        raise NotFoundException("Person not found")
+    for field, value in person_in.model_dump(exclude_unset=True).items():
+        setattr(person, field, value)
+    db.commit()
+    db.refresh(person)
+    return person
+
+
+@router.delete("/people/{person_id}")
+def delete_person(person_id: int, db: Session = Depends(get_db)):
+    person = db.query(Person).filter(Person.id == person_id).first()
+    if not person:
+        raise NotFoundException("Person not found")
+    db.delete(person)
+    db.commit()
+    return {"success": True}
+
+
+@router.post("/people/from-user/{user_id}", response_model=PersonSchema)
+def create_person_from_user(user_id: int, db: Session = Depends(get_db)):
+    """根据已有的 User 自动创建或返回对应的 Person，把“人员”与“用户”打通。"""
+    from app.models import User
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise NotFoundException("User not found")
+    existing = db.query(Person).filter(Person.user_id == user.id).first()
+    if existing:
+        return existing
+    person = Person(
+        name=user.display_name or user.username,
+        email=user.email,
+        department_id=user.department_id,
+        user_id=user.id,
+        role=user.role,
+        is_active=user.is_active,
+    )
+    db.add(person)
+    db.commit()
+    db.refresh(person)
+    return person
+
+
+@router.get("/product-lines", response_model=list[ProductLineSchema])
+def list_product_lines(db: Session = Depends(get_db)):
+    return db.query(ProductLine).order_by(ProductLine.name).all()
+
+
+@router.post("/product-lines", response_model=ProductLineSchema)
+def create_product_line(pl_in: ProductLineCreate, db: Session = Depends(get_db)):
+    pl = ProductLine(**pl_in.model_dump())
+    db.add(pl)
+    db.commit()
+    db.refresh(pl)
+    return pl
+
+
+@router.put("/product-lines/{product_line_id}", response_model=ProductLineSchema)
+def update_product_line(product_line_id: int, pl_in: ProductLineUpdate, db: Session = Depends(get_db)):
+    product_line = db.query(ProductLine).filter(ProductLine.id == product_line_id).first()
+    if not product_line:
+        raise NotFoundException("Product line not found")
+    for field, value in pl_in.model_dump(exclude_unset=True).items():
+        setattr(product_line, field, value)
+    db.commit()
+    db.refresh(product_line)
+    return product_line
+
+
+@router.delete("/product-lines/{product_line_id}")
+def delete_product_line(product_line_id: int, db: Session = Depends(get_db)):
+    product_line = db.query(ProductLine).filter(ProductLine.id == product_line_id).first()
+    if not product_line:
+        raise NotFoundException("Product line not found")
+    db.delete(product_line)
+    db.commit()
+    return {"success": True}

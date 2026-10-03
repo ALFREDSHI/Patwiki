@@ -1,0 +1,87 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import asyncio
+import logging
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
+
+from app.config import settings
+from app.core.error_handler import register_exception_handlers
+from app.database import init_db
+from app.database import SessionLocal
+from app.api.api import api_router
+
+
+logger = logging.getLogger(__name__)
+
+
+async def _automation_scheduler():
+    """Poll lightweight schedule rules for the local desktop process."""
+    from app.services.automation_service import AutomationEngine
+
+    while True:
+        await asyncio.sleep(60)
+        db = SessionLocal()
+        try:
+            AutomationEngine.run_scheduled(db)
+            from app.services.sync_service import SyncService
+            SyncService.run_due_subscriptions(db)
+            from app.services.semantic_job_service import SemanticJobService
+            SemanticJobService.run_due(db)
+        except Exception:
+            logger.exception("automation or external sync schedule tick failed")
+        finally:
+            db.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    from init_data import init_default_data
+    init_default_data()
+    scheduler_task = asyncio.create_task(_automation_scheduler())
+    try:
+        yield
+    finally:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+register_exception_handlers(app)
+
+app.include_router(api_router, prefix=settings.API_PREFIX)
+
+
+@app.get("/")
+async def root():
+    return {
+        "name": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "status": "running",
+        "data_dir": str(settings.DATA_DIR),
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}

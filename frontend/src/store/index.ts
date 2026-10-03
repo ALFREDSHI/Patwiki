@@ -1,0 +1,123 @@
+import { create } from 'zustand'
+import type { Patent, Product, CustomField, Tag, Project, PatentDatabase, PatentView, User, JsonObject } from '../types'
+
+const CURRENT_USER_STORAGE_KEY = 'patwiki_current_user'
+const GROUP_BY_FAMILY_STORAGE_KEY = 'patwiki_group_by_family'
+
+interface AppState {
+  patents: Patent[]
+  totalPatents: number
+  products: Product[]
+  customFields: CustomField[]
+  tags: Tag[]
+  projects: Project[]
+  // 库相关
+  databases: PatentDatabase[]
+  currentDatabaseId: number | null
+  setDatabases: (databases: PatentDatabase[]) => void
+  setCurrentDatabaseId: (id: number | null) => void
+  views: PatentView[]
+  currentViewId: number | null
+  setViews: (views: PatentView[]) => void
+  setCurrentViewId: (id: number | null) => void
+  currentProductId: number | null
+  loading: boolean
+  selectedIds: number[]
+  filters: JsonObject
+  // 同族聚拢开关（localStorage 持久化）
+  groupByFamily: boolean
+  setGroupByFamily: (v: boolean) => void
+  // 权限管理 ：当前用户（localStorage 持久化）
+  currentUser: User | null
+  setCurrentUser: (user: User | null) => void
+  // 数据版本号：导入/删除等操作后自增，驱动列表软刷新（替代 window.location.reload）
+  dataVersion: number
+  bumpDataVersion: () => void
+  setPatents: (patents: Patent[], total: number) => void
+  setProducts: (products: Product[]) => void
+  setCustomFields: (fields: CustomField[]) => void
+  setTags: (tags: Tag[]) => void
+  setProjects: (projects: Project[]) => void
+  setCurrentProductId: (id: number | null) => void
+  setLoading: (loading: boolean) => void
+  setSelectedIds: (ids: number[]) => void
+  setFilters: (filters: JsonObject) => void
+  toggleSelect: (id: number) => void
+  clearSelection: () => void
+}
+
+function loadCurrentUserFromStorage(): User | null {
+  try {
+    const raw = localStorage.getItem(CURRENT_USER_STORAGE_KEY)
+    if (!raw) return null
+    return JSON.parse(raw) as User
+  } catch {
+    return null
+  }
+}
+
+export const useAppStore = create<AppState>((set, get) => ({
+  patents: [],
+  totalPatents: 0,
+  products: [],
+  customFields: [],
+  tags: [],
+  projects: [],
+  databases: [],
+  currentDatabaseId: null,
+  setDatabases: (databases) => set({ databases }),
+  setCurrentDatabaseId: (currentDatabaseId) => set({ currentDatabaseId }),
+  views: [],
+  currentViewId: null,
+  setViews: (views) => set({ views }),
+  setCurrentViewId: (currentViewId) => set({ currentViewId }),
+  currentProductId: null,
+  loading: false,
+  selectedIds: [],
+  filters: {},
+  // 同族聚拢开关，初始值从 localStorage 读取
+  groupByFamily: (() => {
+    try {
+      const saved = localStorage.getItem(GROUP_BY_FAMILY_STORAGE_KEY)
+      // 主表默认开启同族聚拢；用户明确关闭后才保持关闭。
+      return saved === null ? true : saved === 'true'
+    } catch { return true }
+  })(),
+  setGroupByFamily: (v) => {
+    try { localStorage.setItem(GROUP_BY_FAMILY_STORAGE_KEY, String(v)) } catch { /* storage is optional */ }
+    set({ groupByFamily: v })
+  },
+  currentUser: loadCurrentUserFromStorage(),
+  setCurrentUser: (user) => {
+    if (user) {
+      try { localStorage.setItem(CURRENT_USER_STORAGE_KEY, JSON.stringify(user)) } catch { /* storage is optional */ }
+    } else {
+      try { localStorage.removeItem(CURRENT_USER_STORAGE_KEY) } catch { /* storage is optional */ }
+    }
+    set({ currentUser: user })
+  },
+
+  dataVersion: 0,
+  bumpDataVersion: () => set((state) => ({ dataVersion: state.dataVersion + 1 })),
+
+  setPatents: (patents, total) => set({ patents, totalPatents: total }),
+  setProducts: (products) => set({ products }),
+  setCustomFields: (customFields) => set({ customFields }),
+  setTags: (tags) => set({ tags }),
+  setProjects: (projects) => set({ projects }),
+  setCurrentProductId: (currentProductId) => set({ currentProductId }),
+  setLoading: (loading) => set({ loading }),
+  setSelectedIds: (selectedIds) => set({ selectedIds }),
+  setFilters: (filters) => set({ filters }),
+
+  toggleSelect: (id) => {
+    const { selectedIds } = get()
+    if (selectedIds.includes(id)) {
+      set({ selectedIds: selectedIds.filter((i) => i !== id) })
+    } else {
+      set({ selectedIds: [...selectedIds, id] })
+    }
+  },
+
+  clearSelection: () => set({ selectedIds: [] }),
+}))

@@ -1,0 +1,968 @@
+import { useState, useCallback, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import type { ClipboardEvent } from 'react'
+import { importApi, databaseApi, viewApi } from '../../api'
+import { fieldService } from '../../services'
+import { useAppStore } from '../../store'
+import type { ImportPreview, FieldMapping, PatentView, ImportChangeReview, ImportReviewAction, ImportResult } from '../../types'
+import { getErrorMessage } from '../../lib/errors'
+
+interface ImportModalProps {
+  onClose: () => void
+  onSuccess: () => void
+}
+
+const SYSTEM_FIELD_LABELS: Record<string, string> = {
+  title: '专利标题',
+  application_number: '申请号',
+  publication_number: '公开号',
+  grant_number: '授权号',
+  applicant: '申请人',
+  inventor: '发明人',
+  assignee: '专利权人',
+  agent: '代理机构',
+  filing_date: '申请日',
+  publication_date: '公开日',
+  grant_date: '授权日',
+  legal_status: '法律状态',
+  patent_type: '专利类型',
+  country: '国家',
+  ipc_main: 'IPC分类',
+  ipc_all: '全部IPC',
+  cpc_main: 'CPC分类',
+  cpc_all: '全部CPC',
+  priority_date: '优先权日',
+  priority_number: '优先权号',
+  priority_country: '优先权国家',
+  abstract: '摘要',
+  claims: '权利要求',
+  category: '技术分类',
+  subcategory: '子分类',
+  technical_problem: '技术问题',
+  technical_effect: '技术效果',
+  technical_solution: '技术方案',
+  module: '功能模块',
+  has_risk: '是否有风险',
+  risk_level: '风险等级',
+  risk_description: '风险描述',
+  application_status: '应用状态',
+  scope_description: '保护范围',
+  notes: '备注',
+  // 虚拟字段（同族/引用）
+  family_members: '同族专利',
+  cited_patents: '引用专利',
+  citing_patents: '被引用专利',
+  attachments: '嵌入图片/附件',
+}
+
+const SKIP_COLUMN = '__skip__'
+
+const IMPORT_REPORT_LABELS: Record<string, string> = {
+  quarantined: '待处理',
+  retained_source_row: '待补身份',
+  skipped_empty_row: '空行未导入',
+  skipped_duplicate: '未变更',
+  created_pending_title: '已建档待补信息',
+  error_identity: '标识识别失败',
+  apply_error: '导入失败',
+  error_database: '数据库错误',
+}
+
+function isActionableImportReport(status?: string) {
+  return !['created', 'updated', 'reviewed'].includes((status || 'error').toLowerCase())
+}
+
+function importReportReason(report: { status?: string; reason?: string; error?: string }) {
+  if (report.reason || report.error) return report.reason || report.error
+  if (report.status === 'created_pending_title') return '已创建专利 Wiki，待补充标题等著录信息'
+  if (report.status === 'retained_source_row') return '来源行已保留，待补充可识别的公开号或申请号'
+  if (report.status === 'skipped_empty_row') return '该行没有可导入的字段值'
+  return '请在导入治理中检查该行字段'
+}
+
+export default function ImportModal({ onClose, onSuccess }: ImportModalProps) {
+  const navigate = useNavigate()
+  const {
+    currentDatabaseId,
+    databases,
+    products,
+    projects,
+    setDatabases,
+    setCurrentDatabaseId,
+  } = useAppStore()
+
+  // 新增 chooseDatabase 步骤
+  const [step, setStep] = useState<'chooseDatabase' | 'upload' | 'mapping' | 'review' | 'processing' | 'complete'>(
+    databases.length > 0 ? 'upload' : 'chooseDatabase'
+  )
+  const [file, setFile] = useState<File | null>(null)
+  const [preview, setPreview] = useState<ImportPreview | null>(null)
+  const [selectedSheet, setSelectedSheet] = useState<string | null>(null)
+  const [importNote, setImportNote] = useState('')
+  const [mapping, setMapping] = useState<Record<string, string>>({})
+  const [selectedDatabaseId, setSelectedDatabaseId] = useState<number | ''>(
+    currentDatabaseId ?? ''
+  )
+  const [selectedProductId, setSelectedProductId] = useState<number | ''>('')
+  const [selectedProjectId, setSelectedProjectId] = useState<number | ''>('')
+  // 导入到指定视图
+  const [views, setViews] = useState<PatentView[]>([])
+  const [selectedViewId, setSelectedViewId] = useState<number | ''>('')
+  const [showCreateView, setShowCreateView] = useState(false)
+  const [newViewName, setNewViewName] = useState('')
+  const [creatingView, setCreatingView] = useState(false)
+  const [dedupeField, setDedupeField] = useState<'application_number' | 'publication_number' | 'both'>('publication_number')
+  const [reviewChanges, setReviewChanges] = useState<ImportChangeReview[]>([])
+  const [reviewActions, setReviewActions] = useState<Record<number, ImportReviewAction>>({})
+  const [importResult, setImportResult] = useState<ImportResult | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [clipboardUploading, setClipboardUploading] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [error, setError] = useState('')
+
+  const unchangedCount = importResult?.unchanged ?? importResult?.skipped ?? 0
+  const importIssueReports = importResult
+    ? [
+        ...(importResult.row_reports || importResult.error_details || []),
+        ...(importResult.field_error_details || []),
+      ].filter(report => isActionableImportReport(report.status))
+    : []
+
+  const selectFile = (nextFile: File) => {
+    setFile(nextFile)
+    setPreview(null)
+    setSelectedSheet(null)
+  }
+
+  // 新建库表单
+  const [showCreateDb, setShowCreateDb] = useState(false)
+  const [newDbName, setNewDbName] = useState('')
+  const [newDbDesc, setNewDbDesc] = useState('')
+
+  // 库列表为空时自动跳到 chooseDatabase；有库时默认 upload
+  useEffect(() => {
+    if (databases.length === 0) {
+      // Database availability is external state; update the workflow after the check.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setStep('chooseDatabase')
+    } else if (step === 'chooseDatabase' && currentDatabaseId) {
+      setStep('upload')
+    }
+  }, [databases.length, currentDatabaseId, step])
+
+  // 加载当前库的视图列表（用于导入到指定视图）
+  useEffect(() => {
+    if (!currentDatabaseId) {
+      // The view list mirrors the selected database, which is external state.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setViews([])
+      return
+    }
+    viewApi.list(currentDatabaseId).then(setViews).catch(() => setViews([]))
+  }, [currentDatabaseId])
+
+  const handleCreateView = useCallback(async () => {
+    if (!newViewName.trim() || !currentDatabaseId) return
+    setCreatingView(true)
+    try {
+      // 创建成员型视图：只展示导入到本视图的专利
+      const view = await viewApi.create({
+        name: newViewName.trim(),
+        database_id: currentDatabaseId,
+        membership_based: true,
+      })
+      setViews(prev => [...prev, view])
+      setSelectedViewId(view.id)
+      setNewViewName('')
+      setShowCreateView(false)
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, '创建视图失败'))
+    } finally {
+      setCreatingView(false)
+    }
+  }, [newViewName, currentDatabaseId])
+
+  const handleCreateDatabase = useCallback(async () => {
+    if (!newDbName.trim()) return
+    try {
+      const db = await databaseApi.create({ name: newDbName.trim(), description: newDbDesc.trim() || undefined })
+      const refreshed = await databaseApi.list()
+      setDatabases(refreshed)
+      setSelectedDatabaseId(db.id)
+      setCurrentDatabaseId(db.id)
+      setNewDbName('')
+      setNewDbDesc('')
+      setShowCreateDb(false)
+      setStep('upload')
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, '创建库失败'))
+    }
+  }, [newDbName, newDbDesc, setDatabases, setCurrentDatabaseId])
+
+  const handleChooseDatabase = useCallback(() => {
+    if (!selectedDatabaseId) {
+      setError('请选择一个专利库')
+      return
+    }
+    setCurrentDatabaseId(Number(selectedDatabaseId))
+    setError('')
+    setStep('upload')
+  }, [selectedDatabaseId, setCurrentDatabaseId])
+
+  const handleUpload = useCallback(async () => {
+    if (!file) return
+    setUploading(true)
+    setError('')
+    try {
+      const result = await importApi.upload(file, selectedSheet)
+      setPreview(result)
+      setSelectedSheet(result.selected_sheet || null)
+      if ((result.sheets?.length || 0) > 1 && !selectedSheet) {
+        setStep('upload')
+        return
+      }
+      // Unknown columns intentionally remain unmapped. Their raw values are retained
+      // for later governance, rather than automatically becoming formal fields.
+      setMapping(result.suggested_mapping || {})
+      setStep('mapping')
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, '上传失败，请检查文件格式'))
+    } finally {
+      setUploading(false)
+    }
+  }, [file, selectedSheet])
+
+  const handleSheetChange = useCallback(async (sheet: string) => {
+    if (!file) return
+    setUploading(true)
+    setError('')
+    try {
+      const result = await importApi.upload(file, sheet)
+      setPreview(result)
+      setSelectedSheet(result.selected_sheet || sheet)
+      setMapping(result.suggested_mapping || {})
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, '读取 Sheet 失败'))
+    } finally {
+      setUploading(false)
+    }
+  }, [file])
+
+  const handleClipboardPaste = useCallback(async (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const text = event.clipboardData.getData('text/plain')
+    if (!text.trim()) return
+    event.preventDefault()
+    setClipboardUploading(true)
+    setError('')
+    try {
+      const nextFile = new File([text], 'clipboard.tsv', { type: 'text/tab-separated-values' })
+      setFile(nextFile)
+      const result = await importApi.uploadClipboard(text)
+      setPreview(result)
+      setSelectedSheet(null)
+      setMapping(result.suggested_mapping || {})
+      setStep('mapping')
+    } catch (pasteError: unknown) {
+      setError(getErrorMessage(pasteError, '读取剪贴板表格失败'))
+    } finally {
+      setClipboardUploading(false)
+    }
+  }, [])
+
+  const handleImport = useCallback(async () => {
+    if (!preview) return
+    if (!currentDatabaseId) {
+      setError('未选择库，无法导入')
+      setStep('chooseDatabase')
+      return
+    }
+    if (!preview.detected_columns.some(column => mapping[column] === 'publication_number')) {
+      setError('必须先将一列映射为公开号，申请号或授权号不能替代公开号')
+      return
+    }
+    // An empty unknown mapping retains its source evidence; SKIP_COLUMN is an
+    // explicit choice to omit a column from this import's governance queue.
+    setImporting(true)
+    setStep('processing')
+    try {
+      const fieldMappings: FieldMapping[] = preview.detected_columns.map(source => ({
+        source_column: source,
+        target_field: mapping[source] || '',
+      }))
+
+      const result = await importApi.confirmImport(
+        preview.import_id,
+        fieldMappings,
+        dedupeField,
+        true,
+        selectedProductId || undefined,
+        selectedProjectId || undefined,
+        currentDatabaseId,
+        selectedViewId || undefined,
+        selectedSheet || undefined,
+        importNote.trim() || undefined,
+      )
+      // The confirmation endpoint only stages source evidence. Patent rows are
+      // not changed until the review screen is explicitly applied.
+      if (!result || typeof result !== 'object') {
+        setError('导入预审返回异常，请检查数据后重试')
+        setStep('mapping')
+        return
+      }
+      setImportResult(result)
+      if (!result.batch_id) throw new Error('预审批次未返回 batch_id')
+      const changes = await importApi.getChanges(result.batch_id, false)
+      setReviewChanges(changes.items)
+      setReviewActions(Object.fromEntries(changes.items.map(item => [item.id, item.review_action])))
+      setStep('review')
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, '导入失败'))
+      setStep('mapping')
+    } finally {
+      setImporting(false)
+    }
+  }, [preview, mapping, dedupeField, selectedProductId, selectedProjectId, currentDatabaseId, selectedViewId, selectedSheet, importNote])
+
+  const handleApplyReviewedImport = useCallback(async () => {
+    if (!importResult?.batch_id) return
+    setImporting(true)
+    setError('')
+    setStep('processing')
+    try {
+      await importApi.reviewBatch(importResult.batch_id, {
+        items: Object.entries(reviewActions).map(([observationId, action]) => ({
+          observation_id: Number(observationId), action,
+        })),
+        reviewed_by: 'local-user',
+      })
+      const result = await importApi.applyBatch(importResult.batch_id)
+      setImportResult(result)
+      setStep('complete')
+      fieldService.invalidate()
+      try {
+        const importedKeys = Object.values(mapping).filter(key => key && key !== SKIP_COLUMN)
+        const hiddenRaw = localStorage.getItem('patwiki_hidden_fields')
+        if (hiddenRaw) {
+          const hidden = JSON.parse(hiddenRaw) as unknown
+          if (Array.isArray(hidden)) localStorage.setItem('patwiki_hidden_fields', JSON.stringify(hidden.filter(key => !importedKeys.includes(String(key)))))
+        }
+      } catch {
+        // Column preferences are optional and must not block a successful import.
+      }
+    } catch (applyError: unknown) {
+      setError(getErrorMessage(applyError, '执行导入失败'))
+      setStep('review')
+    } finally {
+      setImporting(false)
+    }
+  }, [importResult, mapping, reviewActions])
+
+  const handleRollbackImport = useCallback(async () => {
+    if (!importResult?.batch_id) return
+    try {
+      await importApi.rollbackBatch(importResult.batch_id)
+      setError('本次导入已回撤')
+      fieldService.invalidate()
+    } catch (rollbackError: unknown) {
+      setError(getErrorMessage(rollbackError, '回撤导入失败'))
+    }
+  }, [importResult])
+
+  const handleBackdropClick = (e: React.MouseEvent) => {
+    if (e.target === e.currentTarget) onClose()
+  }
+  const unmappedColumns = new Set(preview?.unmapped_columns || [])
+  const unmappedCount = preview?.unmapped_count ?? unmappedColumns.size
+
+  // Unknown columns stay in the governance queue; users may explicitly skip a column.
+  const skippedCount = preview
+    ? preview.detected_columns.filter(column => mapping[column] === SKIP_COLUMN).length
+    : 0
+
+  const downloadUnmapped = useCallback(async () => {
+    if (!importResult?.batch_id) return
+    try {
+      const blob = await importApi.exportUnmapped({ batch_id: importResult.batch_id })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `patwiki-import-${importResult.batch_id}-unmapped.csv`
+      anchor.style.display = 'none'
+      document.body.appendChild(anchor)
+      anchor.click()
+      window.setTimeout(() => {
+        URL.revokeObjectURL(url)
+        anchor.remove()
+      }, 1000)
+    } catch (downloadError: unknown) {
+      setError(getErrorMessage(downloadError, '下载待治理字段失败'))
+    }
+  }, [importResult])
+
+  const stepTitle = {
+    chooseDatabase: '选择专利库',
+    upload: '上传 Excel 文件',
+    mapping: '字段映射',
+    review: '审查本次导入变更',
+    processing: '正在导入...',
+    complete: '导入完成',
+  }[step]
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
+      }}
+      onClick={handleBackdropClick}
+    >
+      <div style={{ background: 'white', borderRadius: 12, width: '90%', maxWidth: 800, maxHeight: '90vh', overflow: 'auto', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)' }}>
+        <div style={{ padding: '20px 24px', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <h3 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>{stepTitle}</h3>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer', color: '#94a3b8' }}>×</button>
+        </div>
+
+        <div style={{ padding: 24 }}>
+          {error && (
+            <div style={{ background: '#fef2f2', border: '1px solid #fecaca', color: '#dc2626', padding: 12, borderRadius: 6, marginBottom: 16, fontSize: 13 }}>
+              {error}
+            </div>
+          )}
+
+          {/* 第一步 - 选择/创建库 */}
+          {step === 'chooseDatabase' && (
+            <div>
+              <div style={{ background: '#f0f9ff', border: '1px solid #bae6fd', padding: 12, borderRadius: 6, marginBottom: 16, fontSize: 13 }}>
+                导入前请先选择或创建一个专利库。库是顶层品类容器，例如"电钻专利数据库"、"传感器专利数据库"。
+              </div>
+
+              <label style={{ fontSize: 12, color: '#475569', display: 'block', marginBottom: 4 }}>选择已有库</label>
+              <select
+                className="form-input"
+                value={selectedDatabaseId}
+                onChange={(e) => setSelectedDatabaseId(e.target.value ? Number(e.target.value) : '')}
+                style={{ width: '100%', marginBottom: 16 }}
+              >
+                <option value="">-- 请选择 --</option>
+                {databases.map(d => (
+                  <option key={d.id} value={d.id}>
+                    {d.name}{d.patent_count !== undefined ? `（${d.patent_count} 条）` : ''}
+                  </option>
+                ))}
+              </select>
+
+              <div style={{ borderTop: '1px dashed #cbd5e1', paddingTop: 16, marginTop: 8 }}>
+                {!showCreateDb ? (
+                  <button className="btn btn-secondary" onClick={() => setShowCreateDb(true)}>
+                    + 创建新库
+                  </button>
+                ) : (
+                  <div>
+                    <label style={{ fontSize: 12, color: '#475569', display: 'block', marginBottom: 4 }}>库名称</label>
+                    <input
+                      className="form-input"
+                      style={{ width: '100%', marginBottom: 8 }}
+                      placeholder="如：电钻专利数据库"
+                      value={newDbName}
+                      onChange={(e) => setNewDbName(e.target.value)}
+                      autoFocus
+                    />
+                    <label style={{ fontSize: 12, color: '#475569', display: 'block', marginBottom: 4 }}>描述（可选）</label>
+                    <input
+                      className="form-input"
+                      style={{ width: '100%', marginBottom: 12 }}
+                      placeholder="简要描述该库的用途"
+                      value={newDbDesc}
+                      onChange={(e) => setNewDbDesc(e.target.value)}
+                    />
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button className="btn btn-primary" onClick={handleCreateDatabase}>创建并使用</button>
+                      <button className="btn btn-secondary" onClick={() => { setShowCreateDb(false); setNewDbName(''); setNewDbDesc('') }}>取消</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 24 }}>
+                <button className="btn btn-secondary" onClick={onClose}>取消</button>
+                <button
+                  className="btn btn-primary"
+                  disabled={!selectedDatabaseId}
+                  onClick={handleChooseDatabase}
+                >
+                  下一步：上传文件
+                </button>
+              </div>
+            </div>
+          )}
+
+          {step === 'upload' && (
+            <div>
+              {/* 当前库显示 */}
+              <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', padding: '8px 12px', borderRadius: 6, marginBottom: 16, fontSize: 13, color: '#15803d' }}>
+                当前库：<strong>{databases.find(d => d.id === currentDatabaseId)?.name || '未选择'}</strong>
+                <button
+                  onClick={() => setStep('chooseDatabase')}
+                  style={{ marginLeft: 12, background: 'transparent', border: 'none', color: '#15803d', cursor: 'pointer', textDecoration: 'underline', fontSize: 12 }}
+                >
+                  切换
+                </button>
+              </div>
+
+              <div
+                style={{
+                  border: '2px dashed #cbd5e1', borderRadius: 8, padding: 40,
+                  textAlign: 'center', cursor: 'pointer',
+                  background: file ? '#f0fdf4' : '#f8fafc',
+                }}
+                onDragOver={(e) => { e.preventDefault(); e.currentTarget.style.borderColor = '#2563eb' }}
+                onDragLeave={(e) => { e.currentTarget.style.borderColor = '#cbd5e1' }}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  e.currentTarget.style.borderColor = '#cbd5e1'
+                  const f = e.dataTransfer.files[0]
+                  if (f && (f.name.endsWith('.xlsx') || f.name.endsWith('.xls') || f.name.endsWith('.csv'))) {
+                    selectFile(f)
+                  }
+                }}
+                onClick={() => {
+                  const input = document.createElement('input')
+                  input.type = 'file'
+                  input.accept = '.xlsx,.xls,.csv'
+                  input.onchange = (event: Event) => {
+                    const target = event.target
+                    if (!(target instanceof HTMLInputElement)) return
+                    const f = target.files?.[0]
+                    if (f) selectFile(f)
+                  }
+                  input.click()
+                }}
+              >
+                {file ? (
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 500 }}>{file.name}</div>
+                    <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
+                      {(file.size / 1024 / 1024).toFixed(2)} MB - 点击重新选择
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{ fontSize: 14, color: '#334155' }}>点击或拖拽Excel文件到此处上传</div>
+                    <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 8 }}>支持 .xlsx, .xls, .csv 格式</div>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ marginTop: 14, padding: 14, border: '1px solid #dbe5e1', borderRadius: 8, background: '#fbfdfc' }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#334155', marginBottom: 5 }}>从 Excel 复制后直接粘贴</div>
+                <div style={{ fontSize: 12, color: '#64748b', marginBottom: 8 }}>支持单列或多列，第一行作为列标题。粘贴后仍需确认字段映射，未知列会保留待治理。</div>
+                <textarea
+                  className="form-input"
+                  rows={3}
+                  placeholder="点击这里，然后粘贴 Excel 中复制的内容"
+                  onPaste={event => void handleClipboardPaste(event)}
+                  disabled={clipboardUploading}
+                  style={{ resize: 'vertical', minHeight: 72 }}
+                />
+                {clipboardUploading && <div style={{ marginTop: 6, color: '#0f766e', fontSize: 12 }}>正在读取剪贴板数据...</div>}
+              </div>
+
+              {preview && (preview.mapping_issues?.length || 0) > 0 && (
+                <div style={{ background: '#fff7ed', border: '1px solid #fed7aa', color: '#9a3412', padding: 12, borderRadius: 6, marginBottom: 16, fontSize: 12 }}>
+                  {preview.mapping_issues?.map(issue => <div key={`${issue.column}-${issue.target_field || ''}`}>{issue.column}: {issue.reason}</div>)}
+                </div>
+              )}
+
+              {preview?.sheets && preview.sheets.length > 1 && (
+                <div style={{ marginTop: 16, padding: 12, background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 6 }}>
+                  <label style={{ fontSize: 12, color: '#475569', display: 'block', marginBottom: 4 }}>选择导入 Sheet</label>
+                  <select
+                    className="form-input"
+                    value={selectedSheet || preview.selected_sheet || preview.sheets[0]}
+                    disabled={uploading}
+                    onChange={e => void handleSheetChange(e.target.value)}
+                  >
+                    {preview.sheets.map(sheet => <option key={sheet} value={sheet}>{sheet}</option>)}
+                  </select>
+                </div>
+              )}
+
+              <div style={{ marginTop: 20 }}>
+                <p style={{ fontSize: 13, color: '#64748b', marginBottom: 8 }}>导入选项</p>
+                <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+                  <div>
+                    <label style={{ fontSize: 12, color: '#475569', display: 'block', marginBottom: 4 }}>去重依据</label>
+                    <select className="form-input" value={dedupeField} onChange={(e) => {
+                      const value = e.target.value
+                      if (value === 'both' || value === 'application_number' || value === 'publication_number') {
+                        setDedupeField(value)
+                      }
+                    }}>
+                      <option value="both">申请号或公开号</option>
+                      <option value="application_number">仅申请号</option>
+                      <option value="publication_number">仅公开号</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 24 }}>
+                <button className="btn btn-secondary" onClick={onClose}>取消</button>
+                <button className="btn btn-primary" disabled={!file || uploading} onClick={handleUpload}>
+                  {uploading ? '解析中...' : '下一步：预览字段'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {step === 'mapping' && preview && (
+            <div>
+              <div style={{ background: '#f0f9ff', border: '1px solid #bae6fd', padding: 12, borderRadius: 6, marginBottom: 16, fontSize: 13 }}>
+                已识别 <strong>{preview.detected_columns.length}</strong> 列，共 <strong>{preview.total_rows}</strong> 行数据。
+                请确认 Excel 列与系统字段的对应关系。系统暂不认识的列会保留原始值，进入待治理清单，不会自动创建正式字段或参与统计。
+                {unmappedCount > 0 && (
+                  <span style={{ color: '#b45309', marginLeft: 8, fontWeight: 600 }}>
+                    {unmappedCount} 列保留待治理
+                  </span>
+                )}
+                {skippedCount > 0 && (
+                  <span style={{ color: '#64748b', marginLeft: 8, fontWeight: 600 }}>
+                    将跳过 {skippedCount} 列
+                  </span>
+                )}
+                {(preview.embedded_image_count || 0) > 0 && (
+                  <span style={{ color: '#047857', marginLeft: 8, fontWeight: 600 }}>
+                    检测到 {preview.embedded_image_count} 张嵌入图片，确认后写入附件字段
+                  </span>
+                )}
+              </div>
+
+              <div style={{ maxHeight: 350, overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: 6, marginBottom: 16 }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                  <thead>
+                    <tr style={{ background: '#f8fafc' }}>
+                      <th style={{ padding: '8px 12px', textAlign: 'left', fontWeight: 600, width: '30%' }}>Excel列名</th>
+                      <th style={{ padding: '8px 12px', textAlign: 'left', fontWeight: 600, width: '40%' }}>映射到系统字段</th>
+                      <th style={{ padding: '8px 12px', textAlign: 'left', fontWeight: 600 }}>预览（前3条）</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {preview.detected_columns.map((col) => {
+                      const mappedKey = mapping[col] || ''
+                      const isVirtual = ['family_members', 'cited_patents', 'citing_patents'].includes(mappedKey)
+                      const isGovernancePending = !mappedKey
+                      const isSkipped = mappedKey === SKIP_COLUMN
+                      const embeddedImages = (preview.embedded_images || []).filter(image => image.source_field_name === col)
+                      return (
+                        <tr key={col} style={{ borderTop: '1px solid #f1f5f9', opacity: isSkipped ? 0.6 : 1 }}>
+                          <td style={{ padding: '8px 12px', fontWeight: 500 }}>{col}</td>
+                          <td style={{ padding: '6px 12px' }}>
+                            <select
+                              className="form-input"
+                              style={{ fontSize: 12, padding: '4px 8px' }}
+                              value={mappedKey}
+                              onChange={(e) => setMapping(prev => ({ ...prev, [col]: e.target.value }))}
+                            >
+                              <option value="">-- 保留原始列，待治理（默认）--</option>
+                              <option value={SKIP_COLUMN}>-- 跳过本列 --</option>
+                              <optgroup label="系统字段">
+                                {Object.entries(SYSTEM_FIELD_LABELS).map(([f, l]) => (
+                                  <option key={f} value={f}>{l} ({f})</option>
+                                ))}
+                              </optgroup>
+                              {(preview.available_fields || []).filter(field => !field.is_system && field.key !== mappedKey).length > 0 && (
+                                <optgroup label="已有自定义字段">
+                                  {(preview.available_fields || []).filter(field => !field.is_system && field.key !== mappedKey).map(field => (
+                                    <option key={field.key} value={field.key}>{field.name} ({field.key})</option>
+                                  ))}
+                                </optgroup>
+                              )}
+                            </select>
+                            {isGovernancePending && (
+                              <span style={{ display: 'inline-block', marginLeft: 6, padding: '1px 6px', fontSize: 10, background: '#fef3c7', color: '#92400e', borderRadius: 3 }}>
+                                保留待治理
+                              </span>
+                            )}
+                            {isVirtual && (
+                              <span style={{ display: 'inline-block', marginLeft: 6, padding: '1px 6px', fontSize: 10, background: '#e0e7ff', color: '#3730a3', borderRadius: 3 }}>
+                                关系入库
+                              </span>
+                            )}
+                            {embeddedImages.length > 0 && (
+                              <span style={{ display: 'inline-block', marginLeft: 6, padding: '1px 6px', fontSize: 10, background: '#dcfce7', color: '#166534', borderRadius: 3 }}>
+                                {embeddedImages.length} 张图片
+                              </span>
+                            )}
+                            {isSkipped && (
+                              <span style={{ display: 'inline-block', marginLeft: 6, padding: '1px 6px', fontSize: 10, background: '#e2e8f0', color: '#475569', borderRadius: 3 }}>
+                                已跳过
+                              </span>
+                            )}
+                          </td>
+                          <td style={{ padding: '8px 12px', fontSize: 11, color: '#64748b', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {preview.preview_rows.slice(0, 3).map((row, ri) => (
+                              <div key={ri}>{String(row[col] ?? '')}</div>
+                            ))}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <div style={{ display: 'flex', gap: 16, marginBottom: 16 }}>
+                <div style={{ flex: 1 }}>
+                  <label style={{ fontSize: 12, color: '#475569', display: 'block', marginBottom: 4 }}>关联产品（可选）</label>
+                  <select
+                    className="form-input"
+                    value={selectedProductId}
+                    onChange={(e) => {
+                      const nextProductId = e.target.value ? Number(e.target.value) : ''
+                      setSelectedProductId(nextProductId)
+                      setSelectedProjectId('')
+                    }}
+                  >
+                    <option value="">不关联产品</option>
+                    {products.map(product => (
+                      <option key={product.id} value={product.id}>{product.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={{ fontSize: 12, color: '#475569', display: 'block', marginBottom: 4 }}>关联项目（可选）</label>
+                  <select className="form-input" value={selectedProjectId} onChange={(e) => setSelectedProjectId(e.target.value ? Number(e.target.value) : '')}>
+                    <option value="">不关联项目</option>
+                    {projects
+                      .filter(project => !selectedProductId || project.product_id === selectedProductId)
+                      .map(project => (
+                        <option key={project.id} value={project.id}>{project.name}</option>
+                      ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* 导入到指定视图 */}
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ fontSize: 12, color: '#475569', display: 'block', marginBottom: 4 }}>
+                  导入到视图（可选）
+                  <span style={{ fontSize: 11, color: '#94a3b8', marginLeft: 6 }}>
+                    不选则导入到库的主视图
+                  </span>
+                </label>
+                {!showCreateView ? (
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <select
+                      className="form-input"
+                      style={{ flex: 1 }}
+                      value={selectedViewId}
+                      onChange={(e) => setSelectedViewId(e.target.value ? Number(e.target.value) : '')}
+                    >
+                      <option value="">不指定（导入到主视图）</option>
+                      {views.filter(v => !v.is_department_master).map(v => (
+                        <option key={v.id} value={v.id}>{v.name}</option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ whiteSpace: 'nowrap', fontSize: 12 }}
+                      onClick={() => setShowCreateView(true)}
+                    >
+                      + 新建视图
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ border: '1px solid #e2e8f0', borderRadius: 6, padding: 12, background: '#f8fafc' }}>
+                    <div style={{ fontSize: 12, color: '#475569', marginBottom: 6 }}>
+                      新建成员型视图：只展示本次导入的专利
+                    </div>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <input
+                        className="form-input"
+                        style={{ flex: 1 }}
+                        placeholder="如：2024年Q1竞品分析"
+                        value={newViewName}
+                        onChange={(e) => setNewViewName(e.target.value)}
+                        autoFocus
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        style={{ fontSize: 12, whiteSpace: 'nowrap' }}
+                        disabled={!newViewName.trim() || creatingView}
+                        onClick={handleCreateView}
+                      >
+                        {creatingView ? '创建中...' : '创建并选中'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        style={{ fontSize: 12 }}
+                        onClick={() => { setShowCreateView(false); setNewViewName('') }}
+                      >
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ fontSize: 12, color: '#475569', display: 'block', marginBottom: 4 }}>本次导入备注（可选）</label>
+                <textarea className="form-input" rows={2} value={importNote} onChange={event => setImportNote(event.target.value)} placeholder="例如：2025 年度海外竞争对手清单，来自研发部邮件" />
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                <button className="btn btn-secondary" onClick={() => setStep('upload')}>返回</button>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button className="btn btn-secondary" onClick={onClose}>取消</button>
+                  <button className="btn btn-primary" disabled={importing || !preview.detected_columns.some(column => mapping[column] === 'publication_number')} onClick={handleImport}>
+                    {importing ? '分析中...' : `开始预审 ${preview.total_rows} 条数据`}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {step === 'review' && importResult?.batch_id && (
+            <div>
+               <div style={{ background: '#fff7ed', border: '1px solid #fed7aa', padding: 12, borderRadius: 6, marginBottom: 16, fontSize: 13, color: '#9a3412' }}>
+                 预审已完成。系统不会自动覆盖已有值，请逐项选择“采用导入值”或“保留现有值”；未治理列仍会作为待治理字段保留。
+               </div>
+               {(importResult.mapping_warnings?.length || 0) > 0 && (
+                 <div style={{ background: '#fffbeb', border: '1px solid #fde68a', padding: 10, borderRadius: 6, marginBottom: 12, fontSize: 12, color: '#92400e' }}>
+                   <strong>字段映射提醒：</strong>以下问题不会阻止其他合法字段导入，原始值已保留在待治理记录中。
+                   {importResult.mapping_warnings?.map(issue => <div key={`${issue.column}-${issue.target_field || ''}`}>{issue.column}: {issue.reason}</div>)}
+                 </div>
+               )}
+              <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+                <button className="btn btn-secondary" onClick={() => setReviewActions(Object.fromEntries(reviewChanges.map(item => [item.id, item.difference_type === 'new' ? 'fill_empty' : 'keep_existing'])))}>全部按安全建议</button>
+                <button className="btn btn-secondary" onClick={() => setReviewActions(Object.fromEntries(reviewChanges.map(item => [item.id, item.field_resolution === 'mapped' ? 'adopt' : 'keep_existing'])))}>映射字段全部采用</button>
+                <span style={{ fontSize: 12, color: '#64748b', alignSelf: 'center' }}>共 {reviewChanges.length} 个来源单元格</span>
+              </div>
+              <div style={{ maxHeight: 420, overflow: 'auto', border: '1px solid #e2e8f0', borderRadius: 6 }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                  <thead><tr style={{ background: '#f8fafc' }}>
+                    <th style={{ padding: 8, textAlign: 'left' }}>公开号 / 行</th>
+                    <th style={{ padding: 8, textAlign: 'left' }}>字段</th>
+                    <th style={{ padding: 8, textAlign: 'left' }}>当前值</th>
+                    <th style={{ padding: 8, textAlign: 'left' }}>导入值</th>
+                    <th style={{ padding: 8, textAlign: 'left' }}>处理</th>
+                  </tr></thead>
+                  <tbody>{reviewChanges.map(item => {
+                    const publication = String(item.source_row_values?.['公开号'] || item.source_row_values?.publication_number || '-')
+                    const isUnknown = item.field_resolution === 'unmapped_retained'
+                    return <tr key={item.id} style={{ borderTop: '1px solid #f1f5f9' }}>
+                      <td style={{ padding: 8, whiteSpace: 'nowrap' }}>{publication} / {item.source_row}</td>
+                      <td style={{ padding: 8 }}>{item.source_field_name}{item.canonical_field_key ? ` (${item.canonical_field_key})` : '（待治理）'}</td>
+                      <td style={{ padding: 8, maxWidth: 180, wordBreak: 'break-word' }}>{item.current_value || '-'}</td>
+                      <td style={{ padding: 8, maxWidth: 220, wordBreak: 'break-word' }}>{item.candidate_value || item.raw_value || '-'}</td>
+                      <td style={{ padding: 6 }}><select className="form-input" value={reviewActions[item.id] || 'keep_existing'} onChange={event => {
+                        const value = event.target.value as ImportReviewAction
+                        setReviewActions(prev => ({ ...prev, [item.id]: value }))
+                      }}>
+                        <option value="keep_existing">保留现有值</option>
+                        {!isUnknown && <option value="adopt">采用导入值</option>}
+                        {!isUnknown && <option value="fill_empty">仅填充空值</option>}
+                        <option value="ignore">忽略本单元格</option>
+                        <option value="quarantine">隔离待处理</option>
+                      </select></td>
+                    </tr>
+                  })}</tbody>
+                </table>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, marginTop: 18 }}>
+                <button className="btn btn-secondary" onClick={() => setStep('mapping')}>返回调整映射</button>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button className="btn btn-secondary" onClick={onClose}>取消</button>
+                  <button className="btn btn-primary" disabled={importing} onClick={() => void handleApplyReviewedImport()}>{importing ? '执行中...' : '确认并执行导入'}</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {step === 'processing' && (
+            <div style={{ textAlign: 'center', padding: 40 }} aria-busy="true" aria-live="polite">
+              <div className="spinner" style={{ width: 40, height: 40, margin: '0 auto 16px' }}></div>
+              <div className="import-progress-track" role="progressbar" aria-label="导入处理中"><div className="import-progress-indicator" /></div>
+              <p style={{ fontSize: 14, color: '#475569' }}>正在处理数据，请勿关闭窗口...</p>
+              <p style={{ fontSize: 12, color: '#94a3b8', marginTop: 8 }}>正在写入专利、索引和审计记录，请耐心等待</p>
+            </div>
+          )}
+
+              {step === 'complete' && importResult && (
+            <div style={{ textAlign: 'center', padding: 20 }}>
+              <h4 style={{ fontSize: 16, fontWeight: 600, marginBottom: 16 }}>导入完成！</h4>
+              <div style={{ display: 'flex', justifyContent: 'center', gap: 24, marginBottom: 24, flexWrap: 'wrap' }}>
+                <div style={{ textAlign: 'center' }}>
+                  <div style={{ fontSize: 24, fontWeight: 700, color: '#16a34a' }}>{importResult.created}</div>
+                  <div style={{ fontSize: 12, color: '#64748b' }}>新增</div>
+                </div>
+                <div style={{ textAlign: 'center' }}>
+                  <div style={{ fontSize: 24, fontWeight: 700, color: '#2563eb' }}>{importResult.updated}</div>
+                  <div style={{ fontSize: 12, color: '#64748b' }}>更新（字段级合并）</div>
+                </div>
+                <div style={{ textAlign: 'center' }}>
+                  <div style={{ fontSize: 24, fontWeight: 700, color: '#64748b' }}>{unchangedCount}</div>
+                  <div style={{ fontSize: 12, color: '#64748b' }}>未变化（已审查）</div>
+                </div>
+                {importResult.family_links !== undefined && importResult.family_links > 0 && (
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 24, fontWeight: 700, color: '#7c3aed' }}>{importResult.family_links}</div>
+                    <div style={{ fontSize: 12, color: '#64748b' }}>同族关联</div>
+                  </div>
+                )}
+                {importResult.citation_links !== undefined && importResult.citation_links > 0 && (
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 24, fontWeight: 700, color: '#0891b2' }}>{importResult.citation_links}</div>
+                    <div style={{ fontSize: 12, color: '#64748b' }}>引用关联</div>
+                  </div>
+                )}
+                {importResult.errors > 0 && (
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 24, fontWeight: 700, color: '#dc2626' }}>{importResult.errors}</div>
+                    <div style={{ fontSize: 12, color: '#64748b' }}>错误</div>
+                  </div>
+                )}
+                {(importResult.unmapped_retained || 0) > 0 && (
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 24, fontWeight: 700, color: '#b45309' }}>{importResult.unmapped_retained}</div>
+                    <div style={{ fontSize: 12, color: '#64748b' }}>待治理字段值</div>
+                  </div>
+                )}
+                {(importResult.retained_source_rows || 0) > 0 && (
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 24, fontWeight: 700, color: '#b45309' }}>{importResult.retained_source_rows}</div>
+                    <div style={{ fontSize: 12, color: '#64748b' }}>来源行待补身份</div>
+                  </div>
+                )}
+              </div>
+              {importIssueReports.length > 0 && (
+                <div style={{ textAlign: 'left', maxHeight: 220, overflowY: 'auto', marginBottom: 20, border: '1px solid #e2e8f0', borderRadius: 6 }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                    <thead><tr style={{ background: '#f8fafc' }}><th style={{ padding: 8, textAlign: 'left' }}>行号</th><th style={{ padding: 8, textAlign: 'left' }}>处理结果</th><th style={{ padding: 8, textAlign: 'left' }}>说明</th></tr></thead>
+                    <tbody>
+                      {importIssueReports.map((report, index) => (
+                        <tr key={`${report.row}-${report.status}-${index}`} style={{ borderTop: '1px solid #f1f5f9' }}><td style={{ padding: 8 }}>{report.row}</td><td style={{ padding: 8 }}>{IMPORT_REPORT_LABELS[report.status || ''] || report.status || '待检查'}</td><td style={{ padding: 8 }}>{importReportReason(report)}</td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <div style={{ display: 'flex', justifyContent: 'center', gap: 8 }}>
+                {importResult.batch_id && <button className="btn btn-secondary" onClick={() => { onSuccess(); navigate(`/db/${importResult.database_id || currentDatabaseId}/governance?batch_id=${importResult.batch_id}`) }}>查看本批待治理数据</button>}
+                {(importResult.unmapped_retained || 0) > 0 && importResult.batch_id && (
+                  <button className="btn btn-secondary" onClick={downloadUnmapped}>下载本批待治理字段 CSV</button>
+                )}
+                {importResult.batch_id && <button className="btn btn-secondary" onClick={() => void handleRollbackImport()}>回撤本次导入</button>}
+                <button className="btn btn-primary" onClick={onSuccess}>完成</button>
+              </div>
+
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,1579 @@
+export type JsonPrimitive = string | number | boolean | null
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
+export type JsonObject = { [key: string]: JsonValue | undefined }
+
+export interface AIConfig extends JsonObject {
+  ai_enabled?: boolean
+  prompt_template?: string
+  input_fields?: string[]
+}
+
+export type FormulaReturnType = 'text' | 'number' | 'date' | 'boolean'
+
+export interface FormulaConfig {
+  expression: string
+  return_type: FormulaReturnType
+}
+
+export interface Patent {
+  id: number
+  application_number?: string
+  publication_number?: string
+  grant_number?: string
+  title: string
+  abstract?: string
+  claims?: string
+  applicant?: string
+  inventor?: string
+  assignee?: string
+  agent?: string
+  filing_date?: string
+  publication_date?: string
+  grant_date?: string
+  priority_date?: string
+  priority_number?: string
+  priority_country?: string
+  country?: string
+  patent_type?: string
+  legal_status?: string
+  legal_status_date?: string
+  ipc_main?: string
+  ipc_all?: string
+  cpc_main?: string
+  cpc_all?: string
+  database_id?: number
+  database_ids?: number[]
+  database_names?: string[]
+  product_id?: number
+  view_id?: number | null  // 专利归属的视图（导入到指定视图时设置）
+  category?: string
+  subcategory?: string
+  technical_problem?: string
+  technical_effect?: string
+  technical_solution?: string
+  has_risk?: boolean
+  risk_level?: string
+  risk_description?: string
+  module?: string
+  application_status?: string
+  scope_description?: string
+  notes?: string
+  custom_fields?: JsonObject
+  ai_fields?: JsonObject
+  // 同族聚拢相关
+  family_id?: number | null
+  family_size?: number | null
+  family_key?: string | null
+  tags?: Tag[]
+  projects?: Project[]
+  created_at: string
+  updated_at: string
+}
+
+export interface PatentIdentifier {
+  id: number
+  patent_id: number
+  identifier_namespace: string
+  identifier_type: 'application' | 'publication' | 'grant' | 'external' | string
+  raw_value: string
+  raw_values: string[]
+  normalized_value: string
+  jurisdiction_code?: string | null
+  kind_code?: string | null
+  source_system?: string | null
+  source_timestamp?: string | null
+  is_primary: boolean
+  valid_from?: string | null
+  valid_to?: string | null
+}
+
+export interface PatentFieldSource {
+  field_key: string
+  field_display_name: string
+  current_value?: string | null
+  last_source?: string | null
+  last_changed_by?: string | null
+  last_changed_at?: string | null
+  last_source_view_id?: number | null
+  last_source_view_name?: string | null
+  import_batch_id?: number | null
+  source_table_title?: string | null
+  source_import_note?: string | null
+  source_row?: number | null
+  source_field_name?: string | null
+}
+
+export interface PatentIdentityConflict {
+  source_row_id: number
+  batch_id: number
+  filename: string
+  source_table_title?: string | null
+  worksheet_name?: string | null
+  source_row: number
+  resolution_reason?: string | null
+  candidate_patent_ids: number[]
+  source_row_values: JsonObject
+  source_row_hyperlinks?: Record<string, string>
+  observations: {
+    id: number
+    source_field_name: string
+    raw_value?: string | null
+    candidate_value?: string | null
+    difference_type: string
+  }[]
+  created_at?: string | null
+}
+
+export interface PatentShare {
+  id: number
+  patent_id: number
+  token: string
+  title_override?: string | null
+  is_active: boolean
+  expires_at?: string | null
+  access_count: number
+  last_accessed_at?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+  share_path: string
+}
+
+export interface PublicPatent {
+  id: number
+  title: string
+  application_number?: string | null
+  publication_number?: string | null
+  grant_number?: string | null
+  applicant?: string | null
+  inventor?: string | null
+  assignee?: string | null
+  agent?: string | null
+  filing_date?: string | null
+  publication_date?: string | null
+  grant_date?: string | null
+  priority_date?: string | null
+  priority_number?: string | null
+  priority_country?: string | null
+  country?: string | null
+  patent_type?: string | null
+  legal_status?: string | null
+  legal_status_date?: string | null
+  ipc_main?: string | null
+  ipc_all?: string | null
+  cpc_main?: string | null
+  cpc_all?: string | null
+  abstract?: string | null
+  category?: string | null
+  subcategory?: string | null
+  module?: string | null
+  technical_problem?: string | null
+  technical_solution?: string | null
+  technical_effect?: string | null
+  scope_description?: string | null
+  claims?: string | null
+  has_risk?: boolean | null
+  risk_level?: string | null
+  risk_description?: string | null
+  tags: { id: number; name: string; color?: string | null }[]
+  projects: { id: number; name: string }[]
+}
+
+export interface PublicPatentShare {
+  share: PatentShare
+  patent: PublicPatent
+}
+
+export interface SearchSuggestion {
+  kind: string
+  kind_label: string
+  value: string
+  label: string
+  patent_id: number
+  patent_title: string
+}
+
+export interface PatentGraphNode {
+  id: string
+  patent_id: number
+  kind: 'root' | 'family' | 'citation' | string
+  label: string
+  title: string
+  number: string
+  is_placeholder: boolean
+}
+
+export interface PatentGraphEdge {
+  id: string
+  source: string
+  target: string
+  relation: 'family' | 'citation' | string
+  label: string
+}
+
+export interface PatentGraphResponse {
+  root_id: number
+  depth: number
+  nodes: PatentGraphNode[]
+  edges: PatentGraphEdge[]
+  counts: {
+    nodes: number
+    edges: number
+    family_edges: number
+    citation_edges: number
+  }
+}
+
+// 库（PatentDatabase）类型
+export interface PatentDatabase {
+  id: number
+  name: string
+  code?: string
+  description?: string
+  color?: string
+  icon?: string
+  is_default?: boolean
+  is_archived?: boolean
+  patent_count?: number
+  sort_order?: number
+  created_at?: string
+  updated_at?: string
+}
+
+export type ViewLayoutType = 'table' | 'kanban' | 'form' | 'gantt' | 'calendar'
+
+export interface ViewGroupField {
+  field: string
+  direction?: 'asc' | 'desc'
+  collapsed?: boolean
+}
+
+export interface ConditionalFormatCondition {
+  op: string
+  value?: JsonValue
+  unit?: 'day' | 'week' | 'month'
+  style?: {
+    bgColor?: string
+    color?: string
+    fontWeight?: string | number
+    fontStyle?: string
+    textDecoration?: string
+    opacity?: number
+  }
+}
+
+export interface ConditionalFormatRule {
+  id: string
+  field: string
+  conditions: ConditionalFormatCondition[]
+}
+
+export interface PatentFamilyMember {
+  id: number | null
+  publication_number?: string | null
+  application_number?: string | null
+  grant_number?: string | null
+  title: string
+  country?: string | null
+  legal_status?: string | null
+  filing_date?: string | null
+  publication_date?: string | null
+  grant_date?: string | null
+  is_current: boolean
+  database_id?: number | null
+  in_current_database?: boolean
+  status?: 'in_database' | 'other_database' | 'missing_record' | string
+}
+
+export interface PatentFamilyResponse {
+  root_id: number
+  family_id?: number | null
+  family_key?: string | null
+  family_type?: string | null
+  members: PatentFamilyMember[]
+  external_members?: PatentFamilyMember[]
+  missing_members?: PatentFamilyMember[]
+}
+
+export interface PatentCitationItem {
+  relation_id?: number | null
+  patent_id?: number | null
+  publication_number?: string | null
+  application_number?: string | null
+  grant_number?: string | null
+  title?: string | null
+  country?: string | null
+  database_id?: number | null
+  in_current_database: boolean
+  status: 'in_database' | 'other_database' | 'missing_record' | string
+  direction: 'cited' | 'citing' | string
+}
+
+export interface PatentCitationResponse {
+  root_id: number
+  database_id?: number | null
+  cited: PatentCitationItem[]
+  citing: PatentCitationItem[]
+}
+
+export interface ViewColumnConfig {
+  key: string
+  visible?: boolean
+  width?: number
+  order?: number
+}
+
+export interface ViewGroup {
+  key: JsonValue
+  label: string
+  field: string
+  count: number
+  collapsed: boolean
+  subgroups?: ViewGroup[]
+  patents?: Patent[]
+}
+
+export interface GroupedViewResponse {
+  view_id: number
+  total: number
+  page: number
+  page_size: number
+  groups: ViewGroup[]
+  group_by_config: { fields: ViewGroupField[] }
+  conditional_formatting: ConditionalFormatRule[]
+}
+
+export interface PatentView {
+  id: number
+  name: string
+  description?: string
+  template_key?: string | null
+  database_id: number
+  // view_type 表示可见范围；layout_type 表示展示形态。
+  view_type: 'personal' | 'shared' | 'department_master' | string
+  layout_type: ViewLayoutType
+  is_department_master?: boolean
+  is_archived?: boolean
+  filter_config?: JsonObject
+  column_config?: ViewColumnConfig[]
+  sort_config?: { sort_by?: string; sort_order?: 'asc' | 'desc' }
+  group_by_config?: { fields?: ViewGroupField[] } | JsonObject
+  conditional_formatting?: ConditionalFormatRule[]
+  kanban_config?: JsonObject
+  form_config?: JsonObject
+  gantt_config?: JsonObject
+  local_fields?: ViewLocalField[]
+  created_at?: string
+  updated_at?: string
+}
+
+export interface PatentExportTemplate {
+  id: number
+  database_id: number
+  view_id?: number | null
+  template_key: string
+  name: string
+  description?: string | null
+  output_format: 'excel' | 'word' | 'csv' | string
+  field_keys: string[]
+  filter_config: JsonObject
+  sort_config: JsonObject
+  group_by?: string | null
+  version: number
+  is_system: boolean
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface KanbanConfig {
+  group_by_field: string
+  group_values?: JsonValue[]
+  card_fields: string[]
+  card_title_field: string
+}
+
+export interface KanbanCard {
+  id: number
+  title: string
+  group_value: JsonValue
+  fields: JsonObject
+}
+
+export interface KanbanGroup {
+  key: JsonValue
+  label: string
+  count: number
+  cards: KanbanCard[]
+}
+
+export interface KanbanResponse {
+  view_id: number
+  total: number
+  returned: number
+  truncated: boolean
+  group_by_field: string
+  config: KanbanConfig
+  groups: KanbanGroup[]
+}
+
+export interface FormFieldConfig {
+  key: string
+  required?: boolean
+  col_span?: number
+  default?: JsonValue
+  visible_when?: JsonObject
+}
+
+export interface FormSectionConfig {
+  title: string
+  fields: FormFieldConfig[]
+  visible_when?: JsonObject
+}
+
+export interface FormConfig {
+  layout: 'single_column' | 'two_column'
+  submit_label: string
+  sections: FormSectionConfig[]
+}
+
+export interface FormFieldMeta {
+  key: string
+  name: string
+  field_type: string
+  options?: string[] | null
+  description?: string | null
+  is_required?: boolean
+}
+
+export interface FormDefinition {
+  view_id: number
+  view_name: string
+  database_id: number
+  config: FormConfig
+  fields: FormFieldMeta[]
+  public: boolean
+}
+
+export interface FormShareLink {
+  id: number
+  view_id: number
+  token: string
+  is_active: boolean
+  expires_at?: string | null
+  created_at?: string | null
+}
+
+export type GanttTimeScale = 'day' | 'week' | 'month' | 'quarter' | 'year'
+
+export interface GanttConfig {
+  start_field: string
+  end_field: string
+  title_field: string
+  group_by_field?: string
+  time_scale: GanttTimeScale
+  bar_color_field?: string
+  bar_color_map?: Record<string, string>
+}
+
+export interface GanttItem {
+  id: number
+  title: string
+  start: string
+  end: string
+  color: string
+}
+
+export interface GanttGroup {
+  key: JsonValue
+  label: string
+  items: GanttItem[]
+}
+
+export interface GanttResponse {
+  view_id: number
+  total: number
+  returned: number
+  truncated: boolean
+  config: GanttConfig
+  groups: GanttGroup[]
+  time_range: { start: string | null; end: string | null }
+}
+
+export interface ViewLocalField {
+  id: number
+  view_id: number
+  key: string
+  name: string
+  field_type: string
+  options?: string[]
+  is_promoted?: boolean
+  promoted_field_key?: string
+}
+
+export interface ViewPatentListResponse {
+  total: number
+  items: (Patent & { view_local_fields?: Record<string, string | null> })[]
+  page: number
+  page_size: number
+  view_id: number
+  view_filter_config?: JsonObject
+  view_column_config?: PatentView['column_config']
+}
+
+export interface PatentListResponse {
+  total: number
+  items: Patent[]
+  page: number
+  page_size: number
+}
+
+export interface Product {
+  id: number
+  name: string
+  code?: string
+  product_line_id?: number
+  owner_id?: number
+  owner_user_id?: number
+  description?: string
+  category?: string
+  is_active?: boolean
+  patent_count?: number
+  created_at: string
+  updated_at: string
+}
+
+export interface Project {
+  id: number
+  name: string
+  project_no?: string | null
+  code?: string | null
+  product_id?: number | null
+  product_category?: string | null
+  department_ids: number[]
+  product_line_ids: number[]
+  project_level?: string | null
+  project_type?: string | null
+  brands: string[]
+  project_manager?: string | null
+  research_owner?: string | null
+  shipping_regions?: string | null
+  current_stage?: string | null
+  product_model?: string | null
+  description?: string | null
+  module?: string | null
+  start_date?: string | null
+  end_date?: string | null
+  status?: string | null
+  patent_count?: number
+  created_at: string
+  updated_at: string
+}
+
+export interface ProjectSolutionChange {
+  id: number
+  change_type?: string | null
+  feature_name: string
+  before_description?: string | null
+  after_description?: string | null
+  impact_description?: string | null
+  source_description?: string | null
+  created_by: string
+  created_at: string
+}
+
+export interface ProjectSolutionRegion {
+  id: number
+  region_code: string
+  region_name?: string | null
+  created_at: string
+}
+
+export interface ProjectSolutionVersion {
+  id: number
+  database_id: number
+  project_id: number
+  version_no: string
+  name: string
+  project_stage?: string | null
+  status: string
+  effective_from?: string | null
+  effective_to?: string | null
+  change_summary?: string | null
+  change_reason?: string | null
+  source_type?: string | null
+  source_description?: string | null
+  created_by: string
+  confirmed_by?: string | null
+  confirmed_at?: string | null
+  created_at: string
+  updated_at: string
+  changes: ProjectSolutionChange[]
+  regions: ProjectSolutionRegion[]
+}
+
+export interface RiskPatentLink {
+  id: number
+  patent_id: number
+  link_role: string
+  notes?: string | null
+  created_at: string
+}
+
+export interface RiskSolutionLink {
+  id: number
+  solution_version_id: number
+  link_role: string
+  created_at: string
+}
+
+export interface RiskCaseRegion {
+  id: number
+  region_code: string
+  region_name?: string | null
+  created_at: string
+}
+
+export interface RiskAssessment {
+  id: number
+  risk_case_id: number
+  solution_version_id?: number | null
+  jurisdiction_code?: string | null
+  input_hash?: string | null
+  version_no: number
+  assessment_stage?: string | null
+  preliminary_assessment?: string | null
+  analysis_confirmation?: string | null
+  discussion_conclusion?: string | null
+  leadership_confirmation?: string | null
+  decision: string
+  risk_level: string
+  gate_impact: string
+  decision_basis?: string | null
+  mitigation_summary?: string | null
+  evidence_summary?: string | null
+  assessed_by?: string | null
+  reviewed_by?: string | null
+  confirmed_by?: string | null
+  decided_by?: string | null
+  decision_at?: string | null
+  created_by: string
+  created_at: string
+}
+
+export interface RiskReview {
+  id: number
+  risk_case_id: number
+  trigger_type: string
+  trigger_description?: string | null
+  review_outcome: string
+  next_review_condition?: string | null
+  next_review_at?: string | null
+  reviewed_by: string
+  created_at: string
+}
+
+export interface RiskCase {
+  id: number
+  database_id: number
+  case_no?: string | null
+  title: string
+  trigger_reason: string
+  status: string
+  current_risk_level: string
+  current_decision: string
+  current_gate_impact: string
+  current_gate?: string | null
+  next_review_condition?: string | null
+  next_review_at?: string | null
+  notes?: string | null
+  created_by: string
+  created_at: string
+  updated_at: string
+  patent_links: RiskPatentLink[]
+  solution_links: RiskSolutionLink[]
+  regions: RiskCaseRegion[]
+  assessments: RiskAssessment[]
+  reviews: RiskReview[]
+}
+
+export interface Tag {
+  id: number
+  name: string
+  group_id?: number
+  color?: string
+  description?: string
+  created_at: string
+}
+
+export interface TagGroup {
+  id: number
+  name: string
+  description?: string
+  color?: string
+  tags?: Tag[]
+}
+
+export interface ProductLine {
+  id: number
+  name: string
+  code?: string
+  department_id?: number | null
+  description?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface CustomField {
+  id: number
+  key: string
+  name: string
+  field_type: string
+  group_name?: string
+  description?: string
+  options?: string[]
+  default_value?: string
+  is_required?: boolean
+  is_active?: boolean
+  sort_order?: number
+  ai_config?: AIConfig
+  formula_config?: FormulaConfig
+  link_config?: LinkConfig
+  lookup_config?: LookupConfig
+  rollup_config?: RollupConfig
+  created_at: string
+  updated_at: string
+}
+
+export interface LinkConfig {
+  target_table: 'patents' | 'projects' | 'products' | 'people' | 'departments' | 'product-lines' | 'tags' | string
+  display_field?: string
+  allow_multiple?: boolean
+}
+
+export interface LookupConfig {
+  link_field_key: string
+  source_field: string
+  allow_multiple?: boolean
+}
+
+export interface RollupConfig {
+  link_field_key: string
+  source_field?: string
+  aggregation: 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX'
+}
+
+export interface LinkRecord {
+  id: number
+  field_key: string
+  source_table: string
+  source_record_id: number
+  target_table: string
+  target_record_id: number
+  label: string
+  created_at?: string
+}
+
+export interface LinkTarget {
+  id: number
+  label: string
+  target_table: string
+}
+
+export interface RelationBatchItem {
+  record_id: number
+  links?: LinkRecord[]
+  value?: JsonValue
+  aggregation?: string
+}
+
+export interface ImportBatch {
+  id: number
+  filename: string
+  status: string
+  total_rows: number
+  processed_rows: number
+  inserted_count: number
+  updated_count: number
+  duplicate_count: number
+  skipped_count: number
+  error_count: number
+  errors?: JsonObject[]
+  source_table_title?: string
+  worksheet_name?: string
+  source_system?: string
+  import_note?: string | null
+  mapping_version?: string
+  file_hash?: string
+  artifact_path?: string
+  review_config?: JsonObject
+  created_patent_ids?: number[]
+  started_at?: string
+  completed_at?: string
+  created_at: string
+}
+
+export interface ImportPreview {
+  import_id: string
+  detected_columns: string[]
+  preview_rows: Record<string, string>[]
+  total_rows: number
+  suggested_mapping: Record<string, string>
+  unmapped_columns?: string[]
+  unmapped_count?: number
+  mapping_issues?: { column: string; target_field?: string; reason: string; severity?: 'error' | 'warning' }[]
+  available_fields?: FieldMeta[]
+  sheets?: string[]
+  selected_sheet?: string | null
+  embedded_image_count?: number
+  embedded_images?: {
+    sheet_name: string
+    source_row: number
+    source_column: number
+    source_cell: string
+    source_field_name: string
+    filename: string
+    mime_type: string
+    width?: number | null
+    height?: number | null
+  }[]
+  // 返回库列表供选择
+  databases?: PatentDatabase[]
+  default_database_id?: number | null
+}
+
+export interface FieldMapping {
+  source_column: string
+  target_field: string
+}
+
+export interface ImportResult {
+  total: number
+  created: number
+  updated: number
+  skipped: number
+  // `skipped` is retained for older API responses. Reviewed imports use
+  // `unchanged` for rows whose fields did not need a change.
+  unchanged?: number
+  errors: number
+  error_details?: { row: number; status?: string; reason?: string; error?: string; patent_id?: number }[]
+  row_reports?: { row: number; status: string; reason?: string; patent_id?: number }[]
+  field_errors?: number
+  field_error_details?: { row: number; status?: string; reason?: string; error?: string; patent_id?: number }[]
+  // 关系入库统计
+  database_id?: number
+  family_links?: number
+  citation_links?: number
+  batch_id?: number | null
+  unmapped_retained?: number
+  unknown_columns?: string[]
+  status?: string
+  review_count?: number
+  existing_count?: number
+  new_count?: number
+  quarantined_count?: number
+  mapping_warnings?: { column: string; target_field?: string; reason: string; severity?: 'warning' }[]
+  retained_source_rows?: number
+  skipped_empty_rows?: number
+  embedded_image_count?: number
+  imported_image_count?: number
+}
+
+export type SemanticSearchMode = 'keyword' | 'semantic' | 'hybrid'
+
+export interface SemanticSearchResult {
+  patent: Patent
+  scores: {
+    exact: boolean
+    keyword_rank?: number | null
+    vector_rank?: number | null
+    fusion_score?: number | null
+    rerank_score?: number | null
+  }
+  matches: { document_type: string; snippet: string }[]
+}
+
+export interface SemanticSearchResponse {
+  items: SemanticSearchResult[]
+  meta: {
+    mode: SemanticSearchMode
+    profile_id?: number | null
+    index_version?: string | null
+    degraded: boolean
+    degraded_reasons: string[]
+    reranked?: boolean
+    latency_ms: Record<string, number>
+  }
+}
+
+export interface SemanticProvider {
+  id: number
+  name: string
+  provider_kind: 'embedding' | 'rerank'
+  provider_type: string
+  endpoint?: string | null
+  credential_ref?: string | null
+  config_json: JsonObject
+  enabled: boolean
+  last_health_status?: string | null
+  last_health_at?: string | null
+  last_error_code?: string | null
+}
+
+export interface SemanticProfile {
+  id: number
+  name: string
+  is_default: boolean
+  enabled: boolean
+  vector_backend: string
+  embedding_provider_id?: number | null
+  embedding_model?: string | null
+  embedding_dimensions?: number | null
+  rerank_provider_id?: number | null
+  rerank_model?: string | null
+  rerank_enabled: boolean
+  rerank_top_n: number
+  quality_gate_enabled: boolean
+  quality_thresholds: Record<string, number>
+  retrieval_mode: SemanticSearchMode
+  chunk_strategy_version: string
+  indexed_field_allowlist: string[]
+}
+
+export interface SemanticIndex {
+  id: number
+  profile_id: number
+  database_id?: number | null
+  index_version: string
+  backend_type: string
+  status: string
+  is_active: boolean
+  document_count: number
+  patent_count: number
+  last_error_code?: string | null
+}
+
+export interface SemanticJob {
+  id: number
+  profile_id: number
+  index_id?: number | null
+  job_type: string
+  status: string
+  total_items: number
+  processed_items: number
+  failed_items: number
+  error_code?: string | null
+  error_message?: string | null
+  skipped_items: number
+  attempt_count: number
+  max_attempts: number
+  next_retry_at?: string | null
+  lease_expires_at?: string | null
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export interface SemanticStatus {
+  configured_profiles: number
+  active_indexes: number
+  pending_jobs: number
+  outbox_pending: number
+  outbox_retry_wait: number
+  outbox_dead_letter: number
+  job_failed: number
+  job_dead_letter: number
+  document_indexed: number
+  document_pending: number
+  document_stale: number
+  document_failed: number
+  coverage_rate: number
+  last_passed_evaluation_at?: string | null
+  sparse_backend?: string
+  sparse_available?: boolean
+  evaluated_profiles?: number
+  checked_at: string
+}
+
+export interface SemanticEvaluationDataset {
+  id: number
+  name: string
+  version: string
+  description?: string | null
+  enabled: boolean
+  case_count?: number | null
+}
+
+export interface SemanticEvaluationCase {
+  id: number
+  dataset_id: number
+  case_key: string
+  query: string
+  database_id?: number | null
+  relevant_patent_ids: number[]
+  notes?: string | null
+  enabled: boolean
+  created_at?: string | null
+}
+
+export interface SemanticEvaluationRun {
+  id: number
+  dataset_id: number
+  profile_id: number
+  index_version?: string | null
+  mode: SemanticSearchMode
+  top_k: number
+  status: string
+  metrics: Record<string, number>
+  thresholds: Record<string, number>
+  error_code?: string | null
+  error_message?: string | null
+  completed_at?: string | null
+}
+
+export type ImportReviewAction = 'adopt' | 'keep_existing' | 'fill_empty' | 'ignore' | 'quarantine'
+
+export interface ImportChangeReview {
+  id: number
+  batch_id: number
+  source_row: number
+  source_row_id: number
+  patent_id?: number | null
+  source_field_name: string
+  source_column_index?: number | null
+  canonical_field_key?: string | null
+  current_value?: string | null
+  candidate_value?: string | null
+  raw_value?: string | null
+  difference_type: string
+  field_resolution: string
+  review_action: ImportReviewAction
+  final_decision?: ImportReviewAction | null
+  source_table_title?: string | null
+  worksheet_name?: string | null
+  source_row_values?: JsonObject
+  source_row_hyperlinks?: Record<string, string>
+}
+
+export type GovernanceAction = 'retain_source' | 'ignore' | 'map_existing' | 'propose_field'
+
+export interface GovernanceObservation {
+  id: number
+  batch_id: number
+  filename: string
+  source_table_title?: string | null
+  worksheet_name?: string | null
+  source_row_id: number
+  source_row: number
+  source_row_status?: string
+  source_row_reason?: string | null
+  patent_id?: number | null
+  source_field_name: string
+  source_column_index?: number | null
+  canonical_field_key?: string | null
+  raw_value?: string | null
+  normalized_value?: string | null
+  current_value?: string | null
+  candidate_value?: string | null
+  difference_type: string
+  field_resolution: string
+  proposed_action?: string | null
+  final_decision?: string | null
+  decided_by?: string | null
+  decided_at?: string | null
+  source_row_values?: JsonObject
+  source_row_hyperlinks?: Record<string, string>
+  created_at?: string | null
+}
+
+export interface GovernanceDecision {
+  id: number
+  observation_id: number
+  decision_batch_id?: string | null
+  action: GovernanceAction
+  scope: string
+  canonical_field_key?: string | null
+  mapping_version?: string | null
+  adopted_value: boolean
+  decided_by: string
+  reason?: string | null
+  reversed?: boolean
+  created_at?: string | null
+}
+
+export interface GovernanceBatch {
+  decision_batch_id: string
+  decision_count: number
+  action?: GovernanceAction | null
+  scope?: string | null
+  mapping_version?: string | null
+  decided_by?: string | null
+  created_at?: string | null
+  reversed: boolean
+  reversal_reason?: string | null
+  reversed_at?: string | null
+}
+
+export interface Stats {
+  total_patents: number
+  by_legal_status: Record<string, number>
+  by_patent_type: Record<string, number>
+  by_product: { id: number; name: string; count: number }[]
+  by_category: Record<string, number>
+  by_risk_level: Record<string, number>
+  top_inventors: { name: string; count: number }[]
+  top_applicants: { name: string; count: number }[]
+  filing_trend: { year: string; count: number }[]
+  top_ipcs?: { code: string; count: number }[]
+  by_country?: Record<string, number>
+}
+
+export interface Person {
+  id: number
+  name: string
+  email?: string
+  department_id?: number
+  user_id?: number | null
+  role?: string
+  is_active?: boolean
+  notes?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface Department {
+  id: number
+  name: string
+  code?: string
+  department_type?: 'patent' | 'r_and_d' | 'other' | string
+  parent_id?: number | null
+  description?: string
+  members?: Person[]
+  created_at?: string
+}
+
+export interface AITask {
+  id: number
+  task_type: string
+  field_key?: string
+  model_name?: string
+  status: string
+  total_items: number
+  processed_items: number
+  success_count: number
+  failed_count: number
+  errors?: AITaskError[] | null
+  // 请求/返回内容样本
+  request_content?: AITaskRequestSample[] | null
+  response_content?: AITaskResponseSample[] | null
+  started_at?: string
+  completed_at?: string
+  created_at?: string
+}
+
+export interface AITaskRequestSample {
+  patent_id?: number
+  prompt?: string
+}
+
+export interface AITaskResponseSample {
+  patent_id?: number
+  response?: string
+  model?: string
+}
+
+export interface AIFieldValue {
+  field_key: string
+  value: JsonValue | null
+  generated_value: JsonValue | null
+  is_overridden: boolean
+  overridden_at?: string | null
+  updated_at?: string | null
+}
+
+export interface FieldMeta {
+  key: string
+  name: string
+  field_type: 'text' | 'longtext' | 'number' | 'date' | 'select' | 'multiselect' | 'boolean' | 'link' | 'lookup' | 'rollup' | 'formula' | 'textarea' | 'ai_field' | 'multi_select' | 'url' | 'rating' | 'attachment'
+  group_name: string
+  options?: string[] | null
+  width?: number
+  sortable?: boolean
+  filterable?: boolean
+  editable?: boolean
+  frozen?: boolean
+  visible?: boolean
+  is_system?: boolean
+  ai_config?: AIConfig | null
+  formula_config?: FormulaConfig | null
+  is_formula?: boolean
+  dependencies?: string[]
+  link_config?: LinkConfig | null
+  lookup_config?: LookupConfig | null
+  rollup_config?: RollupConfig | null
+}
+
+export interface AttachmentMeta {
+  id: string
+  attachment_id: number
+  attachment_type?: 'patent' | 'project'
+  patent_id?: number | null
+  project_id?: number | null
+  scope?: 'patent' | 'project' | 'project_patent' | string
+  owner_label?: string
+  filename: string
+  file_path?: string
+  file_size: number
+  mime_type: string
+  note?: string | null
+  uploaded_by?: string | null
+  uploaded_at?: string | null
+  download_url: string
+  preview_url: string
+  source_type?: string
+  import_batch_id?: number | null
+  source_sheet?: string | null
+  source_cell?: string | null
+  source_row?: number | null
+  source_column?: number | null
+  source_url?: string | null
+  sha256?: string | null
+  width?: number | null
+  height?: number | null
+  is_image?: boolean
+  deleted_at?: string | null
+}
+
+export interface ProjectHistoryEntry {
+  id: number
+  action: 'created' | 'updated' | string
+  changed_by: string
+  changes: Record<string, { before?: unknown; after?: unknown }>
+  snapshot: Record<string, unknown>
+  created_at?: string | null
+}
+
+export type DashboardCardType = 'metric' | 'bar' | 'pie' | 'donut' | 'line' | 'progress' | 'table' | 'stacked' | 'heatmap'
+
+export interface DashboardCard {
+  id: string
+  type: DashboardCardType
+  title: string
+  config: JsonObject
+  position: { x: number; y: number; w: number; h: number }
+  data?: JsonObject
+}
+
+export interface Dashboard {
+  id: number
+  database_id: number
+  name: string
+  description?: string | null
+  layout: DashboardCard[]
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface DashboardData {
+  dashboard_id: number
+  database_id: number
+  view_id?: number | null
+  total: number
+  cards: DashboardCard[]
+}
+
+export type AutomationTriggerType = 'field_changed' | 'record_created' | 'record_imported' | 'schedule' | 'manual'
+
+export interface AutomationRule {
+  id: number
+  database_id: number
+  name: string
+  description?: string | null
+  is_enabled: boolean
+  priority: number
+  trigger_config: JsonObject
+  condition_config: JsonObject[]
+  action_config: JsonObject[]
+  last_executed_at?: string | null
+  execution_count: number
+  failure_count: number
+}
+
+export interface AutomationLog {
+  id: number
+  rule_id: number
+  patent_id?: number | null
+  trigger_type: string
+  status: 'success' | 'failed' | 'skipped'
+  error_message?: string | null
+  details: JsonObject
+  executed_at?: string | null
+}
+
+export interface SyncConnector {
+  id: number
+  code: string
+  name: string
+  transport: string
+  provider_type: string
+  endpoint?: string | null
+  capabilities: JsonObject
+  mcp_catalog: JsonObject
+  mcp_catalog_updated_at?: string | null
+  enabled: boolean
+  deleted_at?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface McpToolInfo {
+  name: string
+  description?: string
+  inputSchema?: JsonObject
+}
+
+export interface SyncSubscription {
+  id: number
+  database_id: number
+  connector_id: number
+  connector_name?: string | null
+  connector_enabled?: boolean
+  connector_deleted_at?: string | null
+  saved_query_id?: number | null
+  name: string
+  mode: string
+  scope: JsonObject
+  schedule: JsonObject
+  review_policy: string
+  enabled: boolean
+  next_run_at?: string | null
+  last_run_at?: string | null
+  last_status?: string | null
+  tracked_patent_count?: number
+}
+
+export interface SyncRun {
+  id: number
+  subscription_id?: number | null
+  connector_id: number
+  database_id?: number | null
+  trigger: string
+  status: string
+  cursor_before?: string | null
+  cursor_after?: string | null
+  counts: JsonObject
+  error_code?: string | null
+  error_message?: string | null
+  retry_count: number
+  started_at?: string | null
+  finished_at?: string | null
+  created_at?: string | null
+}
+
+export interface ExternalObservation {
+  id: number
+  sync_run_id: number
+  sync_record_id: number
+  patent_id?: number | null
+  canonical_field_key: string
+  raw_value?: string | null
+  normalized_value?: string | null
+  current_value?: string | null
+  candidate_value?: string | null
+  confidence: string
+  decision: string
+  decision_reason?: string | null
+  decided_by?: string | null
+  decided_at?: string | null
+  created_at?: string | null
+}
+
+export interface LegalStatusEvent {
+  id: number
+  patent_id: number
+  connector_id: number
+  provider_event_id: string
+  jurisdiction_code?: string | null
+  event_code: string
+  event_date: string
+  status: string
+  raw_description?: string | null
+  created_at?: string | null
+}
+
+export interface WatchEvent {
+  id: number
+  database_id: number
+  patent_id?: number | null
+  sync_subscription_id?: number | null
+  event_type: string
+  severity: string
+  dedupe_key: string
+  payload: JsonObject
+  status: string
+  acknowledged_by?: string | null
+  acknowledged_at?: string | null
+  occurred_at?: string | null
+}
+
+export interface SyncUpdateItem {
+  id: number
+  batch_id: number
+  patent_id?: number | null
+  external_record_id?: string | null
+  sync_record_id?: number | null
+  external_snapshot_id?: number | null
+  status: string
+  current_fields: JsonObject
+  candidate_fields: JsonObject
+  changed_fields: string[]
+  selected_fields: string[]
+  error_code?: string | null
+  error_message?: string | null
+  created_at?: string | null
+}
+
+export interface SyncUpdateBatch {
+  id: number
+  connector_id?: number | null
+  database_id?: number | null
+  sync_run_id?: number | null
+  status: string
+  requested_patent_ids: number[]
+  selected_fields: string[]
+  expires_at?: string | null
+  confirmed_at?: string | null
+  confirmed_by?: string | null
+  created_at?: string | null
+  items: SyncUpdateItem[]
+}
+
+export interface CommentRecord {
+  id: number
+  patent_id: number
+  parent_id?: number | null
+  author_id?: number | null
+  author_name: string
+  field_key?: string | null
+  content: string
+  mentions: string[]
+  is_resolved: boolean
+  resolved_by?: string | null
+  resolved_at?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+  reply_count: number
+}
+
+export interface CellUpdateRequest {
+  value: JsonValue
+}
+
+// 专利修改历史
+export interface PatentHistory {
+  id: number
+  patent_id: number
+  field_key: string
+  field_display_name?: string
+  old_value?: string | null
+  new_value?: string | null
+  source: string  // manual / bulk / ai / import / api
+  changed_by?: string | null
+  import_batch_id?: number | null
+  source_table_title?: string | null
+  source_import_note?: string | null
+  source_row?: number | null
+  source_field_name?: string | null
+  created_at?: string
+}
+
+// ============================================================
+// 权限管理与协作
+// ============================================================
+export interface User {
+  id: number
+  username: string
+  display_name?: string
+  email?: string
+  role: string  // admin / member
+  employee_no?: string | null
+  department_id?: number | null
+  department_name?: string | null
+  group_id?: number | null
+  group_name?: string | null
+  product_line_id?: number | null
+  product_line_name?: string | null
+  organization_role?: string | null
+  is_active: boolean
+  created_at?: string
+}
+
+export interface CollaborationIdentity {
+  id: number
+  user_uid?: string | null
+  username: string
+  display_name?: string | null
+  roles: string[]
+  active: boolean
+}
+
+export interface CollaborationPackage {
+  package_uid: string
+  package_type?: string
+  direction: string
+  status: string
+  file_hash: string
+  count: number
+  path: string
+  created_at?: string | null
+  signature_status?: string
+  signer_fingerprint?: string | null
+}
+
+export interface DatabaseMember {
+  id: number
+  user_id: number
+  username: string
+  display_name?: string
+  role: string  // owner / editor / viewer
+  created_at?: string
+}
+
+export interface SharedDatabase extends PatentDatabase {
+  my_role?: string
+  owner_id?: number
+}
+
+export type FilterCondition = {
+  field: string
+  operator: 'eq' | 'contains' | 'gt' | 'lt' | 'gte' | 'lte' | 'in' | 'is_empty' | 'is_not_empty'
+  value?: JsonValue
+}
+
+export interface AITaskError {
+  patent_id?: number
+  stage?: string
+  error?: string
+}
+
+export interface AnalyticsDimensionItem {
+  value: string
+  count: number
+  percentage: number
+}
+
+export interface AgentAnalysisResult {
+  requirement: string
+  base_stats: {
+    total: number
+    summary: string
+    dimensions: Record<string, AnalyticsDimensionItem[]>
+    filing_trend: { year: string; count: number }[]
+  }
+  ai_analysis: {
+    overview: string
+    key_findings: string[]
+    dimension_analysis: Record<string, string>
+    anomalies: string[]
+    recommendations: string[]
+    risk_warnings: string[]
+  }
+  created_at: string
+}

@@ -1,0 +1,1033 @@
+from datetime import datetime, date
+from typing import Optional, Any
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class BaseSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PatentBase(BaseSchema):
+    application_number: Optional[str] = None
+    publication_number: Optional[str] = None
+    grant_number: Optional[str] = None
+    title: str
+    abstract: Optional[str] = None
+    claims: Optional[str] = None
+    description_full: Optional[str] = None
+    applicant: Optional[str] = None
+    inventor: Optional[str] = None
+    assignee: Optional[str] = None
+    agent: Optional[str] = None
+    filing_date: Optional[date] = None
+    publication_date: Optional[date] = None
+    grant_date: Optional[date] = None
+    priority_date: Optional[date] = None
+    priority_number: Optional[str] = None
+    priority_country: Optional[str] = None
+    country: Optional[str] = "CN"
+    patent_type: Optional[str] = "invention"
+    legal_status: Optional[str] = "unknown"
+    legal_status_date: Optional[date] = None
+    legal_status_details: Optional[str] = None
+    ipc_main: Optional[str] = None
+    ipc_all: Optional[str] = None
+    cpc_main: Optional[str] = None
+    cpc_all: Optional[str] = None
+    # 允许创建专利时直接指定库归属（之前 schema 漏掉此字段导致只能通过导入设置）
+    database_id: Optional[int] = None
+    product_id: Optional[int] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    technical_problem: Optional[str] = None
+    technical_effect: Optional[str] = None
+    technical_solution: Optional[str] = None
+    has_risk: Optional[bool] = False
+    risk_level: Optional[str] = "none"
+    risk_description: Optional[str] = None
+    module: Optional[str] = None
+    application_status: Optional[str] = None
+    scope_description: Optional[str] = None
+    notes: Optional[str] = None
+    custom_fields: Optional[dict[str, Any]] = {}
+
+
+class PatentCreate(PatentBase):
+    pass
+
+
+class PatentUpdate(BaseSchema):
+    application_number: Optional[str] = None
+    publication_number: Optional[str] = None
+    grant_number: Optional[str] = None
+    country: Optional[str] = None
+    title: Optional[str] = None
+    abstract: Optional[str] = None
+    claims: Optional[str] = None
+    description_full: Optional[str] = None
+    applicant: Optional[str] = None
+    inventor: Optional[str] = None
+    assignee: Optional[str] = None
+    agent: Optional[str] = None
+    filing_date: Optional[date] = None
+    publication_date: Optional[date] = None
+    grant_date: Optional[date] = None
+    legal_status: Optional[str] = None
+    legal_status_date: Optional[date] = None
+    ipc_main: Optional[str] = None
+    product_id: Optional[int] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    technical_problem: Optional[str] = None
+    technical_effect: Optional[str] = None
+    technical_solution: Optional[str] = None
+    has_risk: Optional[bool] = None
+    risk_level: Optional[str] = None
+    risk_description: Optional[str] = None
+    module: Optional[str] = None
+    application_status: Optional[str] = None
+    scope_description: Optional[str] = None
+    notes: Optional[str] = None
+    custom_fields: Optional[dict[str, Any]] = None
+    tag_ids: Optional[list[int]] = None
+    project_ids: Optional[list[int]] = None
+
+
+class Patent(PatentBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+    ai_fields: Optional[dict[str, Any]] = {}
+    # 同族聚拢相关（family_id 来自 Patent.family_id 外键；
+    # family_size 由 list_patents 在 group_by_family=True 时聚合附加，None 表示未计算）
+    family_id: Optional[int] = None
+    family_size: Optional[int] = None
+    family_key: Optional[str] = None
+    # 汇总视图：该 canonical patent 当前被哪些专利库引用。
+    database_ids: list[int] = []
+    database_names: list[str] = []
+    tags: list["Tag"] = []
+    projects: list["Project"] = []
+
+
+class PatentListResponse(BaseSchema):
+    total: int
+    items: list[Patent]
+    page: int
+    page_size: int
+
+
+class BulkUpdateRequest(BaseSchema):
+    patent_ids: list[int]
+    updates: dict[str, Any]
+
+
+class ProductBase(BaseSchema):
+    name: str
+    code: Optional[str] = None
+    product_line_id: Optional[int] = None
+    owner_id: Optional[int] = None
+    owner_user_id: Optional[int] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    is_active: Optional[bool] = True
+
+
+class ProductCreate(ProductBase):
+    pass
+
+
+class ProductUpdate(BaseSchema):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    product_line_id: Optional[int] = None
+    owner_id: Optional[int] = None
+    owner_user_id: Optional[int] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class Product(ProductBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+    patent_count: Optional[int] = 0
+
+
+class ProjectBase(BaseSchema):
+    name: str
+    project_no: Optional[str] = None
+    # Kept for older clients; new clients should use project_no.
+    code: Optional[str] = None
+    product_id: Optional[int] = None
+    product_category: Optional[str] = None
+    department_ids: list[int] = Field(default_factory=list)
+    product_line_ids: list[int] = Field(default_factory=list)
+    project_level: Optional[str] = None
+    project_type: Optional[str] = None
+    brands: list[str] = Field(default_factory=list)
+    project_manager: Optional[str] = None
+    research_owner: Optional[str] = None
+    shipping_regions: Optional[str] = None
+    current_stage: Optional[str] = None
+    product_model: Optional[str] = None
+    description: Optional[str] = None
+    module: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    status: Optional[str] = "in_progress"
+
+
+class ProjectCreate(ProjectBase):
+    pass
+
+
+class ProjectUpdate(BaseSchema):
+    name: Optional[str] = None
+    project_no: Optional[str] = None
+    code: Optional[str] = None
+    product_id: Optional[int] = None
+    product_category: Optional[str] = None
+    department_ids: Optional[list[int]] = None
+    product_line_ids: Optional[list[int]] = None
+    project_level: Optional[str] = None
+    project_type: Optional[str] = None
+    brands: Optional[list[str]] = None
+    project_manager: Optional[str] = None
+    research_owner: Optional[str] = None
+    shipping_regions: Optional[str] = None
+    current_stage: Optional[str] = None
+    product_model: Optional[str] = None
+    description: Optional[str] = None
+    module: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    status: Optional[str] = None
+
+
+class Project(ProjectBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+    patent_count: Optional[int] = 0
+
+
+class ProjectSolutionChangeInput(BaseSchema):
+    change_type: Optional[str] = None
+    feature_name: str
+    before_description: Optional[str] = None
+    after_description: Optional[str] = None
+    impact_description: Optional[str] = None
+    source_description: Optional[str] = None
+
+
+class ProjectSolutionRegionInput(BaseSchema):
+    region_code: str
+    region_name: Optional[str] = None
+
+
+class ProjectSolutionVersionCreate(BaseSchema):
+    database_id: int
+    version_no: Optional[str] = None
+    name: str
+    project_stage: Optional[str] = None
+    effective_from: Optional[date] = None
+    effective_to: Optional[date] = None
+    change_summary: Optional[str] = None
+    change_reason: Optional[str] = None
+    source_type: Optional[str] = None
+    source_description: Optional[str] = None
+    created_by: Optional[str] = "local-user"
+    changes: list[ProjectSolutionChangeInput] = []
+    regions: list[ProjectSolutionRegionInput] = []
+
+
+class ProjectSolutionVersionUpdate(BaseSchema):
+    name: Optional[str] = None
+    project_stage: Optional[str] = None
+    effective_from: Optional[date] = None
+    effective_to: Optional[date] = None
+    change_summary: Optional[str] = None
+    change_reason: Optional[str] = None
+    source_type: Optional[str] = None
+    source_description: Optional[str] = None
+
+
+class ProjectSolutionChange(BaseSchema):
+    id: int
+    change_type: Optional[str] = None
+    feature_name: str
+    before_description: Optional[str] = None
+    after_description: Optional[str] = None
+    impact_description: Optional[str] = None
+    source_description: Optional[str] = None
+    created_by: str
+    created_at: datetime
+
+
+class ProjectSolutionRegion(BaseSchema):
+    id: int
+    region_code: str
+    region_name: Optional[str] = None
+    created_at: datetime
+
+
+class ProjectSolutionVersion(BaseSchema):
+    id: int
+    database_id: int
+    project_id: int
+    version_no: str
+    name: str
+    project_stage: Optional[str] = None
+    status: str
+    effective_from: Optional[date] = None
+    effective_to: Optional[date] = None
+    change_summary: Optional[str] = None
+    change_reason: Optional[str] = None
+    source_type: Optional[str] = None
+    source_description: Optional[str] = None
+    created_by: str
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+    changes: list[ProjectSolutionChange] = []
+    regions: list[ProjectSolutionRegion] = []
+
+
+class SolutionVersionConfirmRequest(BaseSchema):
+    confirmed_by: str = "local-user"
+
+
+class RiskPatentLinkInput(BaseSchema):
+    patent_id: int
+    link_role: Optional[str] = "risk_patent"
+    notes: Optional[str] = None
+
+
+class RiskSolutionLinkInput(BaseSchema):
+    solution_version_id: int
+    link_role: Optional[str] = "primary_solution"
+
+
+class RiskRegionInput(BaseSchema):
+    region_code: str
+    region_name: Optional[str] = None
+
+
+class RiskCaseCreate(BaseSchema):
+    database_id: int
+    case_no: Optional[str] = None
+    title: str
+    trigger_reason: str
+    current_gate: Optional[str] = None
+    notes: Optional[str] = None
+    created_by: Optional[str] = "local-user"
+    patent_links: list[RiskPatentLinkInput] = []
+    solution_links: list[RiskSolutionLinkInput] = []
+    regions: list[RiskRegionInput] = []
+
+
+class RiskCaseUpdate(BaseSchema):
+    case_no: Optional[str] = None
+    title: Optional[str] = None
+    trigger_reason: Optional[str] = None
+    current_gate: Optional[str] = None
+    notes: Optional[str] = None
+    next_review_condition: Optional[str] = None
+    next_review_at: Optional[date] = None
+
+
+class RiskAssessmentCreate(BaseSchema):
+    solution_version_id: Optional[int] = None
+    jurisdiction_code: Optional[str] = None
+    assessment_stage: Optional[str] = None
+    preliminary_assessment: Optional[str] = None
+    analysis_confirmation: Optional[str] = None
+    discussion_conclusion: Optional[str] = None
+    leadership_confirmation: Optional[str] = None
+    decision: str = "pending"
+    risk_level: str = "none"
+    gate_impact: str = "unknown"
+    decision_basis: Optional[str] = None
+    mitigation_summary: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    assessed_by: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[datetime] = None
+    decided_by: Optional[str] = None
+    decision_at: Optional[datetime] = None
+    created_by: Optional[str] = "local-user"
+
+
+class RiskReviewCreate(BaseSchema):
+    trigger_type: str
+    trigger_description: Optional[str] = None
+    review_outcome: str
+    next_review_condition: Optional[str] = None
+    next_review_at: Optional[date] = None
+    reviewed_by: Optional[str] = "local-user"
+
+
+class RiskPatentLink(BaseSchema):
+    id: int
+    patent_id: int
+    link_role: str
+    notes: Optional[str] = None
+    created_at: datetime
+
+
+class RiskSolutionLink(BaseSchema):
+    id: int
+    solution_version_id: int
+    link_role: str
+    created_at: datetime
+
+
+class RiskCaseRegion(BaseSchema):
+    id: int
+    region_code: str
+    region_name: Optional[str] = None
+    created_at: datetime
+
+
+class RiskAssessment(BaseSchema):
+    id: int
+    risk_case_id: int
+    solution_version_id: Optional[int] = None
+    jurisdiction_code: Optional[str] = None
+    input_hash: Optional[str] = None
+    version_no: int
+    assessment_stage: Optional[str] = None
+    preliminary_assessment: Optional[str] = None
+    analysis_confirmation: Optional[str] = None
+    discussion_conclusion: Optional[str] = None
+    leadership_confirmation: Optional[str] = None
+    decision: str
+    risk_level: str
+    gate_impact: str
+    decision_basis: Optional[str] = None
+    mitigation_summary: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    assessed_by: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[datetime] = None
+    decided_by: Optional[str] = None
+    decision_at: Optional[datetime] = None
+    created_by: str
+    created_at: datetime
+
+
+class RiskReview(BaseSchema):
+    id: int
+    risk_case_id: int
+    trigger_type: str
+    trigger_description: Optional[str] = None
+    review_outcome: str
+    next_review_condition: Optional[str] = None
+    next_review_at: Optional[date] = None
+    reviewed_by: str
+    created_at: datetime
+
+
+class RiskCase(BaseSchema):
+    id: int
+    database_id: int
+    case_no: Optional[str] = None
+    title: str
+    trigger_reason: str
+    status: str
+    current_risk_level: str
+    current_decision: str
+    current_gate_impact: str
+    current_gate: Optional[str] = None
+    next_review_condition: Optional[str] = None
+    next_review_at: Optional[date] = None
+    notes: Optional[str] = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+    patent_links: list[RiskPatentLink] = []
+    solution_links: list[RiskSolutionLink] = []
+    regions: list[RiskCaseRegion] = []
+    assessments: list[RiskAssessment] = []
+    reviews: list[RiskReview] = []
+
+
+class TagBase(BaseSchema):
+    name: str
+    group_id: Optional[int] = None
+    color: Optional[str] = None
+    description: Optional[str] = None
+
+
+class TagCreate(TagBase):
+    pass
+
+
+class TagUpdate(BaseSchema):
+    name: Optional[str] = None
+    group_id: Optional[int] = None
+    color: Optional[str] = None
+    description: Optional[str] = None
+
+
+class Tag(TagBase):
+    id: int
+    created_at: datetime
+
+
+class TagGroupBase(BaseSchema):
+    name: str
+    description: Optional[str] = None
+    color: Optional[str] = None
+
+
+class TagGroupCreate(TagGroupBase):
+    pass
+
+
+class TagGroupUpdate(BaseSchema):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+
+
+class TagGroup(TagGroupBase):
+    id: int
+    tags: list[Tag] = []
+
+
+class CustomFieldBase(BaseSchema):
+    key: str
+    name: str
+    field_type: str
+    group_name: Optional[str] = "默认"
+    description: Optional[str] = None
+    options: Optional[list[str]] = None
+    default_value: Optional[str] = None
+    is_required: Optional[bool] = False
+    is_active: Optional[bool] = True
+    sort_order: Optional[int] = 0
+    ai_config: Optional[dict[str, Any]] = None
+    formula_config: Optional[dict[str, Any]] = None
+    link_config: Optional[dict[str, Any]] = None
+    lookup_config: Optional[dict[str, Any]] = None
+    rollup_config: Optional[dict[str, Any]] = None
+
+
+class CustomFieldCreate(CustomFieldBase):
+    pass
+
+
+class CustomFieldUpdate(BaseSchema):
+    name: Optional[str] = None
+    field_type: Optional[str] = None
+    group_name: Optional[str] = None
+    description: Optional[str] = None
+    options: Optional[list[str]] = None
+    default_value: Optional[str] = None
+    is_required: Optional[bool] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+    ai_config: Optional[dict[str, Any]] = None
+    formula_config: Optional[dict[str, Any]] = None
+    link_config: Optional[dict[str, Any]] = None
+    lookup_config: Optional[dict[str, Any]] = None
+    rollup_config: Optional[dict[str, Any]] = None
+
+
+class CustomField(CustomFieldBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class LinkCreateRequest(BaseSchema):
+    field_key: str
+    source_record_id: int
+    target_record_id: int
+    source_table: str = "patents"
+    created_by: Optional[str] = None
+
+
+class LinkDeleteRequest(BaseSchema):
+    field_key: str
+    source_record_id: int
+    target_record_id: int
+    source_table: str = "patents"
+
+
+class LinkRecord(BaseSchema):
+    id: int
+    field_key: str
+    source_table: str
+    source_record_id: int
+    target_table: str
+    target_record_id: int
+    label: str
+    created_at: Optional[datetime] = None
+
+
+class RelationResolveRequest(BaseSchema):
+    record_id: int
+    field_key: str
+    source_table: str = "patents"
+
+
+class RelationBatchRequest(BaseSchema):
+    field_key: str
+    record_ids: list[int]
+    source_table: str = "patents"
+
+
+# 库（PatentDatabase）相关 schema
+class PatentDatabaseBase(BaseSchema):
+    name: str
+    code: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: Optional[int] = 0
+
+
+class PatentDatabaseCreate(PatentDatabaseBase):
+    pass
+
+
+class PatentDatabaseUpdate(BaseSchema):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class PatentDatabase(PatentDatabaseBase):
+    id: int
+    is_default: Optional[bool] = False
+    is_archived: Optional[bool] = False
+    patent_count: Optional[int] = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class PersonBase(BaseSchema):
+    name: str
+    email: Optional[str] = None
+    department_id: Optional[int] = None
+    user_id: Optional[int] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = True
+    notes: Optional[str] = None
+
+
+class PersonCreate(PersonBase):
+    pass
+
+
+class PersonUpdate(BaseSchema):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    department_id: Optional[int] = None
+    user_id: Optional[int] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+class Person(PersonBase):
+    id: int
+    created_at: datetime
+
+
+class DepartmentBase(BaseSchema):
+    name: str
+    code: Optional[str] = None
+    department_type: str = "other"
+    parent_id: Optional[int] = None
+    description: Optional[str] = None
+
+
+class DepartmentCreate(DepartmentBase):
+    pass
+
+
+class DepartmentUpdate(BaseSchema):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class Department(DepartmentBase):
+    id: int
+    members: list[Person] = []
+
+
+class ProductLineBase(BaseSchema):
+    name: str
+    code: Optional[str] = None
+    department_id: Optional[int] = None
+    description: Optional[str] = None
+
+
+class ProductLineCreate(ProductLineBase):
+    pass
+
+
+class ProductLineUpdate(BaseSchema):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ProductLine(ProductLineBase):
+    id: int
+
+
+class ImportPreviewResponse(BaseSchema):
+    columns: list[str]
+    sample_rows: list[dict[str, Any]]
+    total_rows: int
+    suggested_mapping: dict[str, str]
+
+
+class FieldMappingConfig(BaseSchema):
+    name: Optional[str] = None
+    mapping: dict[str, str]
+    options: Optional[dict[str, Any]] = {}
+
+
+class ImportRequest(BaseSchema):
+    mapping_id: Optional[int] = None
+    mapping: dict[str, str]
+    options: Optional[dict[str, Any]] = {}
+    product_id: Optional[int] = None
+
+
+class ImportBatchResponse(BaseSchema):
+    id: int
+    filename: str
+    status: str
+    total_rows: int
+    processed_rows: int
+    inserted_count: int
+    updated_count: int
+    duplicate_count: int
+    skipped_count: int
+    error_count: int
+    errors: Optional[list[dict[str, Any]]] = None
+    source_table_title: Optional[str] = None
+    worksheet_name: Optional[str] = None
+    source_system: Optional[str] = None
+    import_note: Optional[str] = None
+    mapping_version: Optional[str] = None
+    file_hash: Optional[str] = None
+    artifact_path: Optional[str] = None
+    review_config: Optional[dict[str, Any]] = None
+    created_patent_ids: Optional[list[int]] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class AIProcessRequest(BaseSchema):
+    patent_ids: list[int]
+    field_key: str
+    model: Optional[str] = None
+    force_recalculate: Optional[bool] = False
+
+
+class AITaskResponse(BaseSchema):
+    id: int
+    task_type: str
+    field_key: Optional[str]
+    model_name: Optional[str] = None
+    status: str
+    total_items: int
+    processed_items: int
+    success_count: int
+    failed_count: int
+    errors: Optional[list[Any]] = None
+    # 请求/返回内容样本
+    request_content: Optional[list[Any]] = None
+    response_content: Optional[list[Any]] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+
+
+class AIValueOverrideRequest(BaseSchema):
+    field_key: str
+    value: Any
+
+
+class QuickAnalyzeExtraction(BaseSchema):
+    """AI 快速分析的单个抽取目标配置。"""
+    name: str                          # 抽取项名称（也作为 LLM JSON 返回的 key）
+    target_field_key: Optional[str] = None   # 写入已有字段的 key
+    new_field_name: Optional[str] = None     # 新建字段的名称
+    new_field_type: Optional[str] = None     # 新建字段类型（text/textarea/number/...）
+
+
+class QuickAnalyzeRequest(BaseSchema):
+    """AI 快速分析请求：用户自定义输入列、提示词、抽取目标。"""
+    patent_ids: list[int]
+    input_fields: list[str]                          # 作为上下文传入的字段 key
+    prompt: str                                      # 用户自定义提示词
+    extractions: list[QuickAnalyzeExtraction] = []   # 抽取目标列表
+
+
+class JEVQuestion(BaseSchema):
+    """TypeSafe JEV System One question."""
+    type: str
+    instructions: str
+    criteria: Any = None
+
+
+class JEVAnalyzeRequest(BaseSchema):
+    """Structured JEV evaluation for fast patent tagging/triage."""
+    # JEV accepts either a plain string or a structured JSON object. Structured
+    # state is useful when passing title/abstract/claims as named evidence.
+    state: Any
+    questions: dict[str, JEVQuestion]
+    model: Optional[str] = None
+
+
+class StatsResponse(BaseSchema):
+    total_patents: int
+    by_legal_status: dict[str, int]
+    by_patent_type: dict[str, int]
+    by_product: list[dict[str, Any]]
+    by_category: dict[str, int]
+    by_risk_level: dict[str, int]
+    top_inventors: list[dict[str, Any]]
+    top_applicants: list[dict[str, Any]]
+    filing_trend: list[dict[str, Any]]
+    top_ipcs: list[dict[str, Any]] = []
+    by_country: dict[str, int] = {}
+
+
+# ===== 部门级总表与小表（视图）相关 schema =====
+
+class ViewColumnConfig(BaseSchema):
+    """视图列配置项。"""
+    key: str = Field(min_length=1, max_length=100)
+    visible: Optional[bool] = True
+    width: Optional[int] = Field(default=None, ge=40, le=1200)
+    order: Optional[int] = Field(default=0, ge=0)
+
+
+class PatentViewBase(BaseSchema):
+    name: str
+    description: Optional[str] = None
+    database_id: int
+    view_type: Optional[str] = "personal"  # personal / shared / department_master
+    layout_type: Optional[str] = "table"  # table / kanban / form / gantt / calendar
+    filter_config: Optional[dict[str, Any]] = {}
+    column_config: Optional[list[ViewColumnConfig]] = Field(default_factory=list)
+    sort_config: Optional[dict[str, Any]] = {}
+    group_by_config: Optional[dict[str, Any]] = {}
+    conditional_formatting: Optional[list[dict[str, Any]]] = []
+    kanban_config: Optional[dict[str, Any]] = {}
+    form_config: Optional[dict[str, Any]] = {}
+    gantt_config: Optional[dict[str, Any]] = {}
+
+
+class PatentViewCreate(PatentViewBase):
+    is_department_master: Optional[bool] = False
+    # 成员型视图——只展示导入到本视图的专利（自动设置 filter_config.view_id）
+    membership_based: Optional[bool] = False
+
+
+class PatentViewUpdate(BaseSchema):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    view_type: Optional[str] = None
+    layout_type: Optional[str] = None
+    filter_config: Optional[dict[str, Any]] = None
+    column_config: Optional[list[ViewColumnConfig]] = None
+    sort_config: Optional[dict[str, Any]] = None
+    group_by_config: Optional[dict[str, Any]] = None
+    conditional_formatting: Optional[list[dict[str, Any]]] = None
+    kanban_config: Optional[dict[str, Any]] = None
+    form_config: Optional[dict[str, Any]] = None
+    gantt_config: Optional[dict[str, Any]] = None
+    is_archived: Optional[bool] = None
+
+
+class FormSubmitRequest(BaseSchema):
+    data: dict[str, Any] = {}
+    patent_id: Optional[int] = None
+
+
+class FormShareCreateRequest(BaseSchema):
+    expires_days: Optional[int] = None
+
+
+class GanttDateUpdateRequest(BaseSchema):
+    patent_id: int
+    new_start: date
+    new_end: date
+    changed_by: Optional[str] = None
+
+
+class AutomationRuleBase(BaseSchema):
+    name: str
+    description: Optional[str] = None
+    database_id: int
+    is_enabled: bool = True
+    priority: int = 0
+    trigger_config: dict[str, Any] = Field(default_factory=dict)
+    condition_config: list[dict[str, Any]] = Field(default_factory=list)
+    action_config: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AutomationRuleCreate(AutomationRuleBase):
+    pass
+
+
+class AutomationRuleUpdate(BaseSchema):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_enabled: Optional[bool] = None
+    priority: Optional[int] = None
+    trigger_config: Optional[dict[str, Any]] = None
+    condition_config: Optional[list[dict[str, Any]]] = None
+    action_config: Optional[list[dict[str, Any]]] = None
+
+
+class AutomationManualExecuteRequest(BaseSchema):
+    patent_id: Optional[int] = None
+
+
+class DashboardCard(BaseSchema):
+    id: Optional[str] = None
+    type: str
+    title: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    position: dict[str, int] = Field(default_factory=dict)
+
+
+class DashboardCreate(BaseSchema):
+    name: str
+    database_id: int
+    description: Optional[str] = None
+    layout: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DashboardUpdate(BaseSchema):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    layout: Optional[list[dict[str, Any]]] = None
+
+
+class DashboardCardUpdate(BaseSchema):
+    type: Optional[str] = None
+    title: Optional[str] = None
+    config: Optional[dict[str, Any]] = None
+    position: Optional[dict[str, int]] = None
+
+
+class CommentCreate(BaseSchema):
+    content: str
+    author_name: Optional[str] = None
+    author_id: Optional[int] = None
+    parent_id: Optional[int] = None
+    field_key: Optional[str] = None
+
+
+class CommentUpdate(BaseSchema):
+    content: str
+
+
+class CommentResolveRequest(BaseSchema):
+    resolved: bool = True
+    resolved_by: Optional[str] = None
+
+
+class ViewLocalFieldBase(BaseSchema):
+    key: str
+    name: str
+    field_type: str  # text/number/date/select/boolean/textarea
+    options: Optional[list[str]] = None
+    description: Optional[str] = None
+    default_value: Optional[str] = None
+    is_required: Optional[bool] = False
+    sort_order: Optional[int] = 0
+
+
+class ViewLocalFieldCreate(ViewLocalFieldBase):
+    pass
+
+
+class ViewLocalFieldUpdate(BaseSchema):
+    name: Optional[str] = None
+    field_type: Optional[str] = None
+    options: Optional[list[str]] = None
+    description: Optional[str] = None
+    default_value: Optional[str] = None
+    is_required: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+class ViewLocalField(ViewLocalFieldBase):
+    id: int
+    view_id: int
+    is_promoted: bool = False
+    promoted_field_key: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PatentView(PatentViewBase):
+    id: int
+    owner_id: Optional[int] = None
+    is_department_master: bool = False
+    is_archived: bool = False
+    created_at: datetime
+    updated_at: datetime
+    local_fields: list[ViewLocalField] = []
+
+
+class ViewFieldValueUpdate(BaseSchema):
+    """小表本地字段值更新请求。"""
+    value: Optional[Any] = None
+    changed_by: Optional[str] = None
+
+
+class ViewPatentCellUpdate(BaseSchema):
+    """在小表中编辑共享字段的请求（会写入大表并记录来源视图）。"""
+    value: Optional[Any] = None
+    changed_by: Optional[str] = None
+
+
+class KanbanMoveRequest(BaseSchema):
+    """看板卡片跨列移动请求。"""
+    patent_id: int
+    to_value: Optional[Any] = None
+    from_value: Optional[Any] = None
+    changed_by: Optional[str] = None
+
+
+class PromoteFieldRequest(BaseSchema):
+    """将视图本地字段提升为全局 CustomField。"""
+    global_name: Optional[str] = None  # 提升后的全局字段名（默认用原名）
+    global_group: Optional[str] = "从小表提升"
+
+
+class FieldSourceInfo(BaseSchema):
+    """字段来源信息。"""
+    field_key: str
+    field_display_name: Optional[str] = None
+    current_value: Optional[str] = None
+    last_source: Optional[str] = None  # manual/import/ai/bulk/api
+    last_changed_by: Optional[str] = None
+    last_changed_at: Optional[datetime] = None
+    last_source_view_id: Optional[int] = None
+    last_source_view_name: Optional[str] = None
+
+
+Patent.model_rebuild()

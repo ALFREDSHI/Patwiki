@@ -1,0 +1,42 @@
+"""专利库（Database）模型。
+
+库是专利数据的顶层品类归属，例如"电钻专利数据库"、"传感器专利数据库"。
+导入时强制选择库，去重范围限定在库内。
+"""
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, JSON
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+from uuid import uuid4
+
+from app.database import Base
+
+
+class PatentDatabase(Base):
+    __tablename__ = "patent_databases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    database_uid = Column(String(100), unique=True, nullable=True, index=True, default=lambda: f"db_{uuid4().hex}")
+    name = Column(String(200), nullable=False)
+    code = Column(String(50), unique=True, index=True)
+    description = Column(Text)
+    color = Column(String(20))
+    icon = Column(String(50))
+    is_default = Column(Boolean, default=False)
+    kind = Column(String(30), nullable=False, default="personal", index=True)
+    sync_provenance = Column(JSON, nullable=False, default=dict)
+    is_archived = Column(Boolean, default=False)
+    patent_count = Column(Integer, default=0)
+    sort_order = Column(Integer, default=0)
+    # 权限管理：所有者（创建库时记录）
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    patents = relationship("Patent", back_populates="database")
+    patent_memberships = relationship(
+        "PatentDatabaseMembership",
+        back_populates="database",
+        cascade="all, delete-orphan",
+    )
+    memberships = relationship("DatabaseMembership", back_populates="database", cascade="all, delete-orphan")
+    owner = relationship("User", foreign_keys=[owner_id])

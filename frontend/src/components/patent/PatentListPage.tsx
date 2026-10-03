@@ -1,0 +1,5086 @@
+import { Fragment, useState, useEffect, useCallback, useRef, type ReactNode } from 'react'
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
+import {
+  patentService as patentApi,
+  fieldService as fieldApi,
+  aiService as aiApi,
+  customFieldService as customFieldApi,
+  analyticsService as analyticsApi,
+  viewService as viewApi,
+  relationService as linkApi,
+  searchService as searchApi,
+  tagService as tagApi,
+  syncService as syncApi,
+  semanticSearchService,
+} from '../../services'
+import { databaseApi, tagApi as tagManagementApi } from '../../api'
+import { useAppStore } from '../../store'
+import type {
+  Patent, FieldMeta, CustomField, AITask, PatentView, ViewGroup,
+  ViewGroupField, ViewColumnConfig, ConditionalFormatRule, JsonObject, JsonValue, LinkRecord, LinkTarget, SearchSuggestion,
+  Tag,
+  SyncConnector, SyncUpdateBatch,
+  SemanticSearchMode,
+  AttachmentMeta,
+} from '../../types'
+import { getErrorMessage } from '../../lib/errors'
+import { formatApiDate, parseApiDate } from '../../lib/date'
+import Icon, { type IconName } from '../common/Icon'
+import GroupConfigPanel from '../views/GroupConfigPanel'
+import ViewColumnConfigPanel from '../views/ViewColumnConfigPanel'
+import ColumnConfigPanel from '../views/ColumnConfigPanel'
+import ConditionalFormatPanel from '../views/ConditionalFormatPanel'
+import KanbanView from '../views/KanbanView'
+import FormView from '../views/FormView'
+import GanttView from '../views/GanttView'
+import ExportDialog from '../common/ExportDialog'
+import WorkFileDialog from '../common/WorkFileDialog'
+import AttachmentField from '../common/AttachmentField'
+import PatentImageStrip from '../common/PatentImageStrip'
+import ImageLightbox from '../common/ImageLightbox'
+import AIQuickAnalyzeModal from '../ai/AIQuickAnalyzeModal'
+import JEVQuickAnalyzeModal from '../ai/JEVQuickAnalyzeModal'
+import StatsPage from './StatsPage'
+import ViewSwitcher from '../views/ViewSwitcher'
+
+interface PatentListPageProps {
+  onPatentClick: (id: number) => void
+  viewId?: number | null
+  onOpenImport?: () => void
+  onOpenSidebar?: () => void
+}
+
+type SortOrder = 'asc' | 'desc'
+type FilterOperator = 'contains' | 'eq' | 'starts_with' | 'ends_with' | 'is_empty' | 'is_not_empty'
+interface FilterCondition {
+  operator: FilterOperator
+  value?: string
+}
+type FilterState = Record<string, FilterCondition>
+type RelationCellData = { links?: LinkRecord[]; value?: JsonValue; aggregation?: string }
+type BulkTransferAction = 'move_database' | 'move_view' | 'duplicate'
+type TableViewMode = 'pagination' | 'continuous' | 'detail' | 'full_image'
+type RowHeightLimit = 'auto' | 56 | 72 | 96 | 120
+
+const TABLE_VIEW_MODE_STORAGE_KEY = 'patwiki_table_view_mode'
+const ROW_HEIGHT_LIMIT_STORAGE_KEY = 'patwiki_row_height_limit'
+const TABLE_ZOOM_STORAGE_KEY = 'patwiki_table_zoom'
+const CHECKBOX_COLUMN_WIDTH = 40
+const INDEX_COLUMN_WIDTH = 56
+const ACTION_COLUMN_WIDTH = 98
+const PUBLICATION_REFERENCE_RE = /(?<![A-Za-z0-9])([A-Za-z]{2}\d+[A-Za-z]{1,3}\d{0,2})(?![A-Za-z0-9])/g
+const TABLE_POSITION_STORAGE_PREFIX = 'patwiki_table_position:'
+const DETAIL_FIELDS_STORAGE_PREFIX = 'patwiki_detail_fields:'
+const DEFAULT_DETAIL_FIELD_KEYS = ['abstract', 'claims', 'applicant', 'inventor', 'filing_date', 'publication_date', 'legal_status']
+
+function safeHttpUrl(value: string): string | null {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : null
+  } catch {
+    return null
+  }
+}
+
+function isImageUrl(value: string): boolean {
+  try {
+    return /\.(?:png|jpe?g|gif|webp|bmp|svg)(?:$|[?#])/i.test(new URL(value).pathname + new URL(value).search)
+  } catch {
+    return false
+  }
+}
+
+interface TablePositionSnapshot {
+  page: number
+  continuousPage: number
+  scrollTop: number
+  scrollLeft: number
+  savedAt: number
+}
+
+interface TableDataSnapshot {
+  items: Patent[]
+  total: number
+  continuousPage: number
+  hasMore: boolean
+  savedAt: number
+}
+
+// Keep a small in-memory cache for the current browser session. Returning from
+// a Wiki detail page should render the previous result immediately instead of
+// replaying every page that was loaded before navigation.
+const tableDataCache = new Map<string, TableDataSnapshot>()
+const TABLE_DATA_CACHE_LIMIT = 8
+
+function saveTableDataSnapshot(key: string, snapshot: TableDataSnapshot) {
+  tableDataCache.delete(key)
+  tableDataCache.set(key, snapshot)
+  while (tableDataCache.size > TABLE_DATA_CACHE_LIMIT) {
+    const oldestKey = tableDataCache.keys().next().value
+    if (!oldestKey) break
+    tableDataCache.delete(oldestKey)
+  }
+}
+
+function readTableViewMode(): TableViewMode {
+  try {
+    const value = localStorage.getItem(TABLE_VIEW_MODE_STORAGE_KEY)
+    if (value === 'continuous' || value === 'detail' || value === 'full_image') return value
+    return 'pagination'
+  } catch {
+    return 'pagination'
+  }
+}
+
+function readRowHeightLimit(): RowHeightLimit {
+  try {
+    const value = localStorage.getItem(ROW_HEIGHT_LIMIT_STORAGE_KEY)
+    if (value === 'auto') return 'auto'
+    const parsed = Number(value)
+    return [56, 72, 96, 120].includes(parsed) ? parsed as RowHeightLimit : 72
+  } catch {
+    return 72
+  }
+}
+
+function readPageParam(params: URLSearchParams): number {
+  const page = Number(params.get('page'))
+  return Number.isInteger(page) && page > 0 ? page : 1
+}
+
+const FILTER_OPERATOR_LABELS: Record<FilterOperator, string> = {
+  contains: '包含',
+  eq: '等于',
+  starts_with: '开头是',
+  ends_with: '结尾是',
+  is_empty: '为空',
+  is_not_empty: '不为空',
+}
+
+function readFilterParam(params: URLSearchParams): FilterState {
+  const raw = params.get('filters')
+  if (!raw) return {}
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const result: FilterState = {}
+    Object.entries(parsed).forEach(([key, value]) => {
+      if (typeof value === 'string' && value.trim()) {
+        // Compatibility with URLs generated before structured filters.
+        result[key] = { operator: 'contains', value }
+        return
+      }
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return
+      const candidate = value as Record<string, unknown>
+      const operator = (candidate.operator || Object.keys(candidate).find(item => item in FILTER_OPERATOR_LABELS)) as FilterOperator | undefined
+      if (!operator || !(operator in FILTER_OPERATOR_LABELS)) return
+      const candidateValue = candidate.value ?? candidate[operator]
+      result[key] = { operator, ...(typeof candidateValue === 'string' ? { value: candidateValue } : {}) }
+    })
+    return result
+  } catch {
+    return {}
+  }
+}
+
+function filterConditionHasValue(condition?: FilterCondition): boolean {
+  if (!condition) return false
+  return condition.operator === 'is_empty' || condition.operator === 'is_not_empty' || !!condition.value?.trim()
+}
+
+function PatentReferenceText({
+  value,
+  onOpen,
+}: {
+  value: string
+  onOpen: (publicationNumber: string) => void
+}) {
+  const parts: React.ReactNode[] = []
+  let lastIndex = 0
+  const publicationReferencePattern = new RegExp(PUBLICATION_REFERENCE_RE.source, 'g')
+  let match: RegExpExecArray | null
+  while ((match = publicationReferencePattern.exec(value)) !== null) {
+    if (match.index > lastIndex) parts.push(value.slice(lastIndex, match.index))
+    const reference = match[1]
+    parts.push(
+      <button
+        type="button"
+        key={`${reference}-${match.index}`}
+        className="cell-action-btn"
+        title="打开此公开号对应的 PatWiki"
+        onClick={(event) => {
+          event.stopPropagation()
+          onOpen(reference)
+        }}
+        style={{ border: 0, padding: 0, background: 'transparent', color: '#2563eb', cursor: 'pointer', textDecoration: 'underline', font: 'inherit' }}
+      >
+        {reference.toUpperCase().replace(/^JP0+(?=\d)/, 'JP')}
+      </button>,
+    )
+    lastIndex = match.index + match[0].length
+  }
+  if (lastIndex < value.length) parts.push(value.slice(lastIndex))
+  return <>{parts.length > 0 ? parts : value}</>
+}
+
+const DEFAULT_COLUMN_WIDTH = 150
+
+function CellEditor({
+  field,
+  value,
+  onSave,
+  onCancel,
+}: {
+  field: FieldMeta
+  value: JsonValue
+  onSave: (value: JsonValue) => void
+  onCancel: () => void
+}) {
+  const [draft, setDraft] = useState(() => String(value ?? ''))
+  const commonStyle: React.CSSProperties = {
+    width: '100%', padding: '4px 8px', border: '1px solid #3b82f6',
+    borderRadius: 3, fontSize: 13, outline: 'none', background: '#fff',
+  }
+  const submit = () => {
+    if (field.field_type === 'boolean') onSave(draft === 'true' ? true : draft === 'false' ? false : null)
+    else onSave(draft || null)
+  }
+  const isMultiline = ['longtext', 'textarea', 'text', 'url'].includes(field.field_type)
+  return (
+    <div className="cell-editor-popover" onClick={event => event.stopPropagation()}>
+      {field.field_type === 'select' && field.options ? (
+        <select style={commonStyle} autoFocus value={draft} onChange={event => setDraft(event.target.value)}>
+          <option value="">-</option>
+          {field.options.map(option => <option key={option} value={option}>{option}</option>)}
+        </select>
+      ) : field.field_type === 'boolean' ? (
+        <select style={commonStyle} autoFocus value={draft} onChange={event => setDraft(event.target.value)}>
+          <option value="">-</option><option value="true">是</option><option value="false">否</option>
+        </select>
+      ) : isMultiline ? (
+        <textarea style={{ ...commonStyle, minHeight: 90, resize: 'vertical', lineHeight: 1.45 }} autoFocus value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') onCancel(); if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) submit() }} />
+      ) : (
+        <input type={field.field_type === 'number' ? 'number' : field.field_type === 'date' ? 'date' : 'text'} style={commonStyle} autoFocus value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') onCancel(); if (event.key === 'Enter') submit() }} />
+      )}
+      <div className="cell-editor-actions">
+        <button type="button" className="btn btn-xs btn-secondary" onClick={onCancel}>取消</button>
+        <button type="button" className="btn btn-xs btn-primary" onClick={submit}>保存</button>
+      </div>
+    </div>
+  )
+}
+
+function readTableZoom(): number {
+  try {
+    const value = Number(localStorage.getItem(TABLE_ZOOM_STORAGE_KEY))
+    return [75, 85, 100, 115, 130, 150].includes(value) ? value : 100
+  } catch {
+    return 100
+  }
+}
+
+function getViewGroupFields(view?: PatentView): ViewGroupField[] {
+  const config = view?.group_by_config
+  if (Array.isArray(config)) return config as ViewGroupField[]
+  return (config as { fields?: ViewGroupField[] } | undefined)?.fields || []
+}
+
+function buildViewColumnConfig(view: PatentView, fields: FieldMeta[]): ViewColumnConfig[] {
+  const configured = view.column_config || []
+  const byKey = new Map(configured.map(column => [column.key, column]))
+  const known = fields.map((field, index) => {
+    const column = byKey.get(field.key)
+    return {
+      key: field.key,
+      // 关系原始列属于信息中心的正式只读投影。历史视图没有保存这些新列
+      // 时默认展示；用户明确隐藏后仍以视图配置为准。
+      visible: column?.visible ?? (configured.length === 0 || ['family_members', 'cited_patents', 'citing_patents', 'original_links'].includes(field.key)
+        ? field.visible !== false
+        : false),
+      width: column?.width ?? field.width ?? DEFAULT_COLUMN_WIDTH,
+      order: column?.order ?? configured.length + index,
+    }
+  })
+  const knownKeys = new Set(known.map(column => column.key))
+  return [...known, ...configured.filter(column => !knownKeys.has(column.key))]
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+}
+
+function flattenGroups(groups: ViewGroup[]): Patent[] {
+  return groups.flatMap(group => group.subgroups
+    ? flattenGroups(group.subgroups)
+    : (group.patents || []))
+}
+
+interface GroupPresentation {
+  visibleIds: Set<number>
+  headerIds: Set<number>
+  headers: Map<number, { id: string; label: string; field: string; count: number; depth: number }[]>
+}
+
+function getGroupPresentation(groups: ViewGroup[], collapsedKeys: Set<string>): GroupPresentation {
+  const visibleIds = new Set<number>()
+  const headerIds = new Set<number>()
+  const headers = new Map<number, { id: string; label: string; field: string; count: number; depth: number }[]>()
+  const firstLeafPatent = (items: ViewGroup[]): Patent | undefined => {
+    for (const item of items) {
+      if (item.patents?.[0]) return item.patents[0]
+      const nested = firstLeafPatent(item.subgroups || [])
+      if (nested) return nested
+    }
+    return undefined
+  }
+  const walk = (items: ViewGroup[], path: string[], parentCollapsed: boolean) => {
+    items.forEach(group => {
+      const id = [...path, `${group.field}:${group.key ?? '__empty__'}`].join('|')
+      const isCollapsed = parentCollapsed || collapsedKeys.has(id)
+      const children = group.subgroups || []
+      const leafPatents = group.patents || []
+      const firstPatent = leafPatents[0] || firstLeafPatent(children)
+      if (firstPatent) {
+        headerIds.add(firstPatent.id)
+        const currentHeaders = headers.get(firstPatent.id) || []
+        headers.set(firstPatent.id, [...currentHeaders, { id, label: group.label, field: group.field, count: group.count, depth: path.length }])
+      }
+      if (isCollapsed) return
+      if (children.length > 0) walk(children, [...path, id], false)
+      leafPatents.forEach(patent => visibleIds.add(patent.id))
+    })
+  }
+  walk(groups, [], false)
+  return { visibleIds, headerIds, headers }
+}
+
+function getDefaultCollapsedKeys(groups: ViewGroup[], path: string[] = []): string[] {
+  return groups.flatMap(group => {
+    const id = [...path, `${group.field}:${group.key ?? '__empty__'}`].join('|')
+    const nested = getDefaultCollapsedKeys(group.subgroups || [], [...path, id])
+    return [ ...(group.collapsed ? [id] : []), ...nested ]
+  })
+}
+
+interface LinkFieldEditorProps {
+  patentId: number
+  field: FieldMeta
+  currentLinks: LinkRecord[]
+  onChanged: (links: LinkRecord[]) => void
+  onCancel: () => void
+}
+
+function LinkFieldEditor({ patentId, field, currentLinks, onChanged, onCancel }: LinkFieldEditorProps) {
+  const [selectedLinks, setSelectedLinks] = useState<LinkRecord[]>(currentLinks)
+  const [targets, setTargets] = useState<LinkTarget[]>([])
+  const [search, setSearch] = useState('')
+  const [savingTargetId, setSavingTargetId] = useState<number | null>(null)
+  const allowMultiple = field.link_config?.allow_multiple !== false
+
+  useEffect(() => {
+    let cancelled = false
+    const loadTargets = async () => {
+      try {
+        const result = await linkApi.search(field.key, search, 20)
+        if (!cancelled) setTargets(result)
+      } catch (error: unknown) {
+        if (!cancelled) console.error('Failed to load link targets:', error)
+      }
+    }
+    void loadTargets()
+    return () => { cancelled = true }
+  }, [field.key, search])
+
+  const addLink = async (target: LinkTarget) => {
+    if (selectedLinks.some(link => link.target_record_id === target.id)) return
+    setSavingTargetId(target.id)
+    try {
+      const created = await linkApi.create({
+        field_key: field.key,
+        source_record_id: patentId,
+        target_record_id: target.id,
+      })
+      const next = allowMultiple ? [...selectedLinks, created] : [created]
+      setSelectedLinks(next)
+      onChanged(next)
+      if (!allowMultiple) setSearch('')
+    } catch (error: unknown) {
+      alert('添加关联失败: ' + getErrorMessage(error))
+    } finally {
+      setSavingTargetId(null)
+    }
+  }
+
+  const removeLink = async (link: LinkRecord) => {
+    try {
+      await linkApi.delete({
+        field_key: field.key,
+        source_record_id: patentId,
+        target_record_id: link.target_record_id,
+      })
+      const next = selectedLinks.filter(item => item.id !== link.id)
+      setSelectedLinks(next)
+      onChanged(next)
+    } catch (error: unknown) {
+      alert('移除关联失败: ' + getErrorMessage(error))
+    }
+  }
+
+  return (
+    <div
+      style={{ minWidth: 250, padding: 4 }}
+      onClick={event => event.stopPropagation()}
+    >
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+        {selectedLinks.map(link => (
+          <span key={link.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 6px', borderRadius: 4, background: '#eff6ff', color: '#1d4ed8', fontSize: 12 }}>
+            <span>{link.label}</span>
+            <button
+              type="button"
+              className="cell-action-btn"
+              title="移除关联"
+              onClick={() => void removeLink(link)}
+              style={{ border: 'none', background: 'transparent', color: '#1d4ed8', cursor: 'pointer', padding: 0, lineHeight: 1 }}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+        {selectedLinks.length === 0 && <span style={{ color: '#94a3b8', fontSize: 12 }}>尚未关联记录</span>}
+      </div>
+      {(allowMultiple || selectedLinks.length === 0) && (
+        <>
+          <input
+            className="form-input"
+            autoFocus
+            value={search}
+            placeholder="搜索目标记录..."
+            onChange={event => setSearch(event.target.value)}
+            style={{ width: '100%', fontSize: 12, padding: '4px 6px' }}
+          />
+          <div style={{ maxHeight: 120, overflowY: 'auto', marginTop: 4, border: '1px solid #e5e7eb', borderRadius: 4, background: '#fff' }}>
+            {targets.map(target => (
+              <button
+                type="button"
+                key={target.id}
+                className="cell-action-btn"
+                disabled={savingTargetId === target.id || selectedLinks.some(link => link.target_record_id === target.id)}
+                onClick={() => void addLink(target)}
+                style={{ display: 'block', width: '100%', textAlign: 'left', border: 'none', background: 'transparent', padding: '5px 7px', cursor: selectedLinks.some(link => link.target_record_id === target.id) ? 'default' : 'pointer', color: selectedLinks.some(link => link.target_record_id === target.id) ? '#94a3b8' : '#374151', fontSize: 12 }}
+              >
+                {target.label}
+              </button>
+            ))}
+            {targets.length === 0 && <div style={{ padding: '6px 7px', color: '#94a3b8', fontSize: 12 }}>没有匹配记录</div>}
+          </div>
+        </>
+      )}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
+        <button type="button" className="btn btn-xs btn-secondary cell-action-btn" onClick={onCancel}>完成</button>
+      </div>
+    </div>
+  )
+}
+
+interface ToolbarMenuProps {
+  label?: ReactNode
+  icon?: IconName
+  iconOnly?: boolean
+  title?: string
+  triggerClassName?: string
+  align?: 'left' | 'right'
+  children: (close: () => void) => ReactNode
+}
+
+function ToolbarMenu({
+  label,
+  icon,
+  iconOnly = false,
+  title,
+  triggerClassName = 'btn btn-sm btn-secondary',
+  align = 'left',
+  children,
+}: ToolbarMenuProps) {
+  const [open, setOpen] = useState(false)
+  const wrapperRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!wrapperRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener('click', handleClickOutside)
+    return () => document.removeEventListener('click', handleClickOutside)
+  }, [open])
+
+  return (
+    <div className="toolbar-menu" ref={wrapperRef}>
+      <button
+        type="button"
+        className={triggerClassName}
+        onClick={() => setOpen(value => !value)}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label={iconOnly ? title : undefined}
+        title={title}
+      >
+        {iconOnly
+          ? <Icon name={icon ?? 'more-horizontal'} size={16} />
+          : <>{icon && <Icon name={icon} size={14} />} {label} <Icon name={open ? 'chevron-up' : 'chevron-down'} size={13} /></>}
+      </button>
+      {open && (
+        <div className={`datagrid-tool-menu ${align === 'right' ? 'datagrid-tool-menu-right' : 'datagrid-tool-menu-left'}`} role="menu">
+          {children(() => setOpen(false))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function PatentListPage({ onPatentClick, viewId = null, onOpenImport, onOpenSidebar }: PatentListPageProps) {
+  const {
+    patents, totalPatents, currentProductId, currentDatabaseId, loading, databases, products,
+    setPatents, setLoading, selectedIds, toggleSelect, clearSelection, setSelectedIds,
+    groupByFamily, setGroupByFamily, views, setViews, setCurrentProductId,
+    dataVersion, setDatabases,
+  } = useAppStore()
+
+  const updatePatentAttachments = useCallback((patentId: number, fieldKey: string, attachments: AttachmentMeta[]) => {
+    setPatents(patents.map(item => item.id === patentId
+      ? { ...item, custom_fields: { ...(item.custom_fields || {}), [fieldKey]: attachments as unknown as JsonValue } }
+      : item), totalPatents)
+  }, [patents, setPatents, totalPatents])
+
+  const rowImages = (patent: Patent): AttachmentMeta[] => {
+    const values = Object.values(patent.custom_fields || {})
+    return values.flatMap(value => Array.isArray(value)
+      ? value.filter(item => typeof item === 'object' && item !== null) as unknown as AttachmentMeta[]
+      : []).filter(item => item.is_image || item.mime_type?.startsWith('image/'))
+  }
+
+  // 用 ref 保存 views，避免 views 变化时 loadPatents 被重建触发重渲染循环。
+  // 原因：App.tsx 的视图加载 effect 依赖 searchParamsString，每次 URL 变化（含
+  // 翻页）都会重跑并 setViews(新数组) → loadPatents 因依赖 views 被重建 →
+  // loadPatents effect 重跑 → 又触发 URL 同步 → 又导致 searchParamsString 变化
+  // → 死循环。改用 ref 后 loadPatents 不再依赖 views，循环被打破。
+  const viewsRef = useRef(views)
+  useEffect(() => {
+    viewsRef.current = views
+  }, [views])
+
+  const location = useLocation()
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const searchParamsString = searchParams.toString()
+  const isGlobalMasterTable = location.pathname === '/patents' && !searchParams.has('db')
+  const routeDatabaseId = Number(location.pathname.match(/^\/db\/(\d+)(?:\/|$)/)?.[1])
+  const queryDatabaseId = Number(searchParams.get('db'))
+  const activeDatabaseId = Number.isInteger(routeDatabaseId) && routeDatabaseId > 0
+    ? routeDatabaseId
+    : Number.isInteger(queryDatabaseId) && queryDatabaseId > 0
+      ? queryDatabaseId
+      : currentDatabaseId
+  const activeView = views.find(view => view.id === viewId && view.database_id === activeDatabaseId)
+  const [page, setPage] = useState(() => readPageParam(searchParams))
+  const [pageSize] = useState(50)
+  const [tableViewMode, setTableViewMode] = useState<TableViewMode>(() => readTableViewMode())
+  const [rowHeightLimit, setRowHeightLimit] = useState<RowHeightLimit>(() => readRowHeightLimit())
+  const [tableZoom, setTableZoom] = useState(() => readTableZoom())
+  const [continuousLoading, setContinuousLoading] = useState(false)
+  const [searchText, setSearchText] = useState(() => searchParams.get('q') || '')
+  const [searchInputText, setSearchInputText] = useState(() => searchParams.get('q') || '')
+  const [searchMode, setSearchMode] = useState<SemanticSearchMode>(() => {
+    const mode = searchParams.get('search_mode')
+    return mode === 'keyword' || mode === 'semantic' || mode === 'hybrid' ? mode : 'hybrid'
+  })
+  const [semanticNotice, setSemanticNotice] = useState('')
+  const [searchSuggestions, setSearchSuggestions] = useState<SearchSuggestion[]>([])
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1)
+  const [sortField, setSortField] = useState<string>(() => searchParams.get('sort') || 'filing_date')
+  const [sortOrder, setSortOrder] = useState<SortOrder>(() => searchParams.get('order') === 'asc' ? 'asc' : 'desc')
+  const [fields, setFields] = useState<FieldMeta[]>([])
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>({})
+  const [undoStack, setUndoStack] = useState<Array<{ patentId: number; fieldKey: string; before: JsonValue; after: JsonValue }>>([])
+  const [redoStack, setRedoStack] = useState<Array<{ patentId: number; fieldKey: string; before: JsonValue; after: JsonValue }>>([])
+  const [columnUndo, setColumnUndo] = useState<{ viewId: number | null; beforeConfig: ViewColumnConfig[] | null; afterConfig: ViewColumnConfig[] | null; beforeFields: FieldMeta[]; afterFields: FieldMeta[] } | null>(null)
+  const [columnRedo, setColumnRedo] = useState<{ viewId: number | null; beforeConfig: ViewColumnConfig[] | null; afterConfig: ViewColumnConfig[] | null; beforeFields: FieldMeta[]; afterFields: FieldMeta[] } | null>(null)
+  const [activeHeaderMenu, setActiveHeaderMenu] = useState<string | null>(null)
+  const [headerFilterText, setHeaderFilterText] = useState<string>('')
+  const [headerFilterOperator, setHeaderFilterOperator] = useState<FilterOperator>('contains')
+  const [editingCell, setEditingCell] = useState<{ patentId: number; fieldKey: string } | null>(null)
+  const [resizing, setResizing] = useState<{ fieldKey: string; startX: number; startWidth: number } | null>(null)
+  const [showFieldConfig, setShowFieldConfig] = useState(false)
+  const [showDetailFieldConfig, setShowDetailFieldConfig] = useState(false)
+  const [detailFieldConfig, setDetailFieldConfig] = useState<Record<string, string[]>>({})
+  const [pendingColumnDelete, setPendingColumnDelete] = useState<string | null>(null)
+  const [showClearDatabase, setShowClearDatabase] = useState(false)
+  const [clearingDatabase, setClearingDatabase] = useState(false)
+  const [urlImagePreview, setUrlImagePreview] = useState<{ src: string; title?: string } | null>(null)
+  const [showTableSettings, setShowTableSettings] = useState(false)
+  const [viewConfigNotice, setViewConfigNotice] = useState('')
+  const [showBulkEdit, setShowBulkEdit] = useState(false)
+  const [showBulkTag, setShowBulkTag] = useState(false)
+  const [showQuickSelect, setShowQuickSelect] = useState(false)
+  const [quickSelectRange, setQuickSelectRange] = useState('1-10')
+  const [quickSelectLoading, setQuickSelectLoading] = useState(false)
+  // 表头勾选范围菜单（当前页 / 当前库全部 / 按序号范围）
+  const [selectScopeMenu, setSelectScopeMenu] = useState<{ x: number; y: number } | null>(null)
+  const [scopeSelecting, setScopeSelecting] = useState(false)
+  const [bulkTransferAction, setBulkTransferAction] = useState<BulkTransferAction | null>(null)
+  const [bulkTargetDatabaseId, setBulkTargetDatabaseId] = useState<number | null>(null)
+  const [bulkTargetViewId, setBulkTargetViewId] = useState<number | null>(null)
+  const [showQuickAnalyze, setShowQuickAnalyze] = useState(false)
+  const [showJEVAnalyze, setShowJEVAnalyze] = useState(false)
+  const [jevAnalyzePatentIds, setJevAnalyzePatentIds] = useState<number[]>([])
+  const [quickAnalyzePatentIds, setQuickAnalyzePatentIds] = useState<number[]>([])
+  const [quickAnalyzeInputFields, setQuickAnalyzeInputFields] = useState<string[]>([])
+  const [showInsertAIColumn, setShowInsertAIColumn] = useState(false)
+  const [insertColType, setInsertColType] = useState<'text' | 'longtext' | 'number' | 'date' | 'select' | 'boolean' | 'attachment'>('text')
+  const [insertAnchorFieldKey, setInsertAnchorFieldKey] = useState<string | null>(null)
+  const [insertSide, setInsertSide] = useState<'before' | 'after'>('after')
+  const [insertColFrozen, setInsertColFrozen] = useState(false)
+  const [newAIColumnName, setNewAIColumnName] = useState('')
+  const [newColumnOptions, setNewColumnOptions] = useState('')
+  const [creatingAIColumn, setCreatingAIColumn] = useState(false)
+  const [frozenFields, setFrozenFields] = useState<Set<string>>(new Set())
+  const [showColumnStats, setShowColumnStats] = useState(false)
+  const [showPatentAnalysis, setShowPatentAnalysis] = useState(false)
+  const [analysisScope, setAnalysisScope] = useState<'all' | 'view' | 'selected'>('view')
+  const familyRebuildDatabaseRef = useRef<number | null>(null)
+  const [statsFieldKey, setStatsFieldKey] = useState('')
+  const [statsData, setStatsData] = useState<{ value: string; count: number; percentage: number }[]>([])
+  const [statsLoading, setStatsLoading] = useState(false)
+  const [showStatsToTags, setShowStatsToTags] = useState(false)
+  const [tagGroupName, setTagGroupName] = useState('自动分类')
+  const [autoApplyTags, setAutoApplyTags] = useState(true)
+  const [convertingTags, setConvertingTags] = useState(false)
+  const [bulkModule, setBulkModule] = useState('')
+  const [bulkRiskLevel, setBulkRiskLevel] = useState('')
+  const [bulkCategory, setBulkCategory] = useState('')
+  const [bulkLegalStatus, setBulkLegalStatus] = useState('')
+  const [bulkCountry, setBulkCountry] = useState('')
+  const [bulkApplicant, setBulkApplicant] = useState('')
+  const [bulkFieldKey, setBulkFieldKey] = useState('')
+  const [bulkFieldValue, setBulkFieldValue] = useState('')
+  // 批量打标签
+  const [tagsList, setTagsList] = useState<Tag[]>([])
+  const [bulkTagIds, setBulkTagIds] = useState<number[]>([])
+  const [bulkTagMode, setBulkTagMode] = useState<'add' | 'remove' | 'replace'>('add')
+  const [bulkTagLoading, setBulkTagLoading] = useState(false)
+  const [bulkCategoryTag, setBulkCategoryTag] = useState('')
+  const [filterValues, setFilterValues] = useState<FilterState>(() => readFilterParam(searchParams))
+  const [customFields, setCustomFields] = useState<CustomField[]>([])
+  const [relationData, setRelationData] = useState<Record<string, Record<number, RelationCellData>>>({})
+  const [pageInputValue, setPageInputValue] = useState('')
+  const [aiProcessingRow, setAiProcessingRow] = useState<number | null>(null)
+  // AI 任务透明化：跟踪所有运行中的任务
+  const [activeAITasks, setActiveAITasks] = useState<AITask[]>([])
+  const [aiPanelOpen, setAiPanelOpen] = useState(true)
+  // 任务 → 触发时记录的元信息（field name、prompt、引用列、输出位置）
+  const [taskMeta, setTaskMeta] = useState<Record<number, {
+    fieldName: string
+    fieldKey: string
+    prompt: string
+    referencedColumns: string[]
+    outputLocation: string
+    targetCount: number
+  }>>({})
+  // 最近完成的任务（保留几秒用于显示成功提示）
+  const [recentCompleted, setRecentCompleted] = useState<{ taskId: number; meta: typeof taskMeta[number] | undefined; task: AITask | undefined } | null>(null)
+  // 右键上下文菜单
+  const [contextMenu, setContextMenu] = useState<{
+    x: number
+    y: number
+    type: 'row' | 'header'
+    patentId?: number
+    fieldKey?: string
+  } | null>(null)
+  const [groupedGroups, setGroupedGroups] = useState<ViewGroup[]>([])
+  const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(new Set())
+  const [collapsedFamilyKeys, setCollapsedFamilyKeys] = useState<Set<string>>(new Set())
+  const [showGroupConfig, setShowGroupConfig] = useState(false)
+  const [showConditionalConfig, setShowConditionalConfig] = useState(false)
+  const [showExportDialog, setShowExportDialog] = useState(false)
+  const [showWorkFileDialog, setShowWorkFileDialog] = useState(false)
+  const [showAddToView, setShowAddToView] = useState(false)
+  const [addToViewId, setAddToViewId] = useState<number | null>(null)
+  const [showSyncUpdate, setShowSyncUpdate] = useState(false)
+  const [syncUpdatePatentIds, setSyncUpdatePatentIds] = useState<number[]>([])
+  const [syncUpdateConnectors, setSyncUpdateConnectors] = useState<SyncConnector[]>([])
+  const [syncUpdateConnectorId, setSyncUpdateConnectorId] = useState<number | null>(null)
+  const [syncUpdateBatch, setSyncUpdateBatch] = useState<SyncUpdateBatch | null>(null)
+  const [syncUpdateFields, setSyncUpdateFields] = useState<Record<number, string[]>>({})
+  const [syncUpdateRequestedFields, setSyncUpdateRequestedFields] = useState<string[]>([])
+  const [syncUpdateLoading, setSyncUpdateLoading] = useState(false)
+  const syncUpdateConnector = syncUpdateConnectors.find(item => item.id === syncUpdateConnectorId)
+  const syncUpdateSupportedKeys = syncUpdateConnector?.provider_type === 'himmpat_mcp'
+    ? ['publication_number', 'application_number', 'title', 'abstract', 'applicant', 'assignee', 'inventor', 'filing_date', 'publication_date', 'country', 'ipc_all', ...(syncUpdateConnector.capabilities.legal_events === true ? ['legal_status', 'grant_date'] : [])]
+    : ['publication_number', 'application_number', 'grant_number', 'title', 'abstract', 'applicant', 'assignee', 'inventor', 'agent', 'filing_date', 'publication_date', 'grant_date', 'country', 'ipc_main', 'ipc_all', 'cpc_main', 'priority_number', 'priority_date', 'legal_status']
+  const syncUpdateSupportedFields = fields.filter(field => syncUpdateSupportedKeys.includes(field.key))
+
+  // 用于丢弃快速翻页/切库时旧请求的响应：每次发起 loadPatents 自增，
+  // 返回时若 ID 不等于最新值，说明已有更新请求在路上，直接丢弃结果。
+  const loadPatentsRequestId = useRef(0)
+  const patentsRef = useRef(patents)
+  const totalPatentsRef = useRef(totalPatents)
+  const continuousPageRef = useRef(1)
+  const continuousLoadingRef = useRef(false)
+  const continuousHasMoreRef = useRef(true)
+  const tableWrapperRef = useRef<HTMLDivElement>(null)
+  const restoredScopeRef = useRef<string | null>(null)
+  const [activeCell, setActiveCell] = useState<{ patentId: number; fieldKey: string } | null>(null)
+  const [scrollEdges, setScrollEdges] = useState({ atTop: true, atBottom: true })
+
+  const tableScopeKey = `${TABLE_POSITION_STORAGE_PREFIX}${JSON.stringify({
+    databaseId: isGlobalMasterTable ? null : activeDatabaseId ?? null,
+    viewId: viewId ?? null,
+    productId: currentProductId ?? null,
+    search: searchText.trim(),
+    searchMode,
+    filters: filterValues,
+    sortField,
+    sortOrder,
+    groupByFamily,
+    mode: tableViewMode,
+    page: tableViewMode === 'continuous' ? null : page,
+  })}`
+
+  const detailConfigKey = `${activeView?.id ?? `database-${activeDatabaseId ?? 'global'}`}`
+  const configuredDetailKeys = detailFieldConfig[detailConfigKey]
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(`${DETAIL_FIELDS_STORAGE_PREFIX}${detailConfigKey}`)
+      if (raw) {
+        const keys = JSON.parse(raw)
+        if (Array.isArray(keys)) setDetailFieldConfig(current => ({ ...current, [detailConfigKey]: keys.filter(item => typeof item === 'string') }))
+      }
+    } catch { /* local storage is optional */ }
+  }, [detailConfigKey])
+
+  const saveDetailFieldKeys = (keys: string[]) => {
+    const normalized = fields.map(field => field.key).filter(key => keys.includes(key))
+    setDetailFieldConfig(current => ({ ...current, [detailConfigKey]: normalized }))
+    try { localStorage.setItem(`${DETAIL_FIELDS_STORAGE_PREFIX}${detailConfigKey}`, JSON.stringify(normalized)) } catch { /* local storage is optional */ }
+    setShowDetailFieldConfig(false)
+  }
+
+  const readTablePosition = useCallback((): TablePositionSnapshot | null => {
+    try {
+      const raw = sessionStorage.getItem(tableScopeKey)
+      if (!raw) return null
+      const parsed = JSON.parse(raw) as Partial<TablePositionSnapshot>
+      if (!Number.isFinite(parsed.scrollTop) || !Number.isFinite(parsed.continuousPage)) return null
+      return {
+        page: Number.isInteger(parsed.page) && (parsed.page as number) > 0 ? parsed.page as number : 1,
+        continuousPage: Math.max(1, Math.floor(parsed.continuousPage as number)),
+        scrollTop: Math.max(0, parsed.scrollTop as number),
+        scrollLeft: Math.max(0, Number(parsed.scrollLeft) || 0),
+        savedAt: Number(parsed.savedAt) || 0,
+      }
+    } catch {
+      return null
+    }
+  }, [tableScopeKey])
+
+  const saveTablePosition = useCallback(() => {
+    const element = tableWrapperRef.current
+    if (!element) return
+    const snapshot: TablePositionSnapshot = {
+      page,
+      continuousPage: continuousPageRef.current,
+      scrollTop: element.scrollTop,
+      scrollLeft: element.scrollLeft,
+      savedAt: Date.now(),
+    }
+    try { sessionStorage.setItem(tableScopeKey, JSON.stringify(snapshot)) } catch { /* session storage is optional */ }
+  }, [page, tableScopeKey])
+
+  const scrollLibraryTo = useCallback((edge: 'top' | 'bottom') => {
+    const element = tableWrapperRef.current
+    if (!element) return
+    element.scrollTo({
+      top: edge === 'top' ? 0 : element.scrollHeight,
+      behavior: 'smooth',
+    })
+  }, [])
+
+  // 悬浮快捷按钮只在真正可滚动、且不在对应边缘时出现，避免遮挡内容。
+  const updateScrollEdges = useCallback((node?: HTMLDivElement | null) => {
+    const element = node ?? tableWrapperRef.current
+    if (!element) return
+    const maxScroll = element.scrollHeight - element.clientHeight
+    const atTop = element.scrollTop <= 1
+    const atBottom = maxScroll <= 1 || element.scrollTop >= maxScroll - 1
+    setScrollEdges(prev => (prev.atTop === atTop && prev.atBottom === atBottom ? prev : { atTop, atBottom }))
+  }, [])
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => updateScrollEdges())
+    const handleResize = () => updateScrollEdges()
+    window.addEventListener('resize', handleResize)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      window.removeEventListener('resize', handleResize)
+    }
+  }, [patents, tableViewMode, viewId, updateScrollEdges])
+
+  useEffect(() => {
+    const handleLibraryShortcut = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      if (target?.isContentEditable || (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return
+      if (event.key !== 'Home' && event.key !== 'End') return
+      if (!event.ctrlKey && !event.metaKey && !event.altKey) return
+      event.preventDefault()
+      scrollLibraryTo(event.key === 'Home' ? 'top' : 'bottom')
+    }
+    document.addEventListener('keydown', handleLibraryShortcut)
+    return () => document.removeEventListener('keydown', handleLibraryShortcut)
+  }, [scrollLibraryTo])
+
+  const openPatent = useCallback((patentId: number) => {
+    saveTablePosition()
+    onPatentClick(patentId)
+  }, [onPatentClick, saveTablePosition])
+
+  useEffect(() => {
+    // Sidebar navigation unmounts this page. Persist the last viewport so
+    // returning from another tool restores the exact table position.
+    return () => saveTablePosition()
+  }, [saveTablePosition])
+
+  const openContextPatent = useCallback(() => {
+    const patentId = contextMenu?.patentId
+    if (patentId) openPatent(patentId)
+    setContextMenu(null)
+  }, [contextMenu?.patentId, openPatent])
+
+  useEffect(() => {
+    patentsRef.current = patents
+  }, [patents])
+
+  useEffect(() => {
+    totalPatentsRef.current = totalPatents
+  }, [totalPatents])
+
+  const handleTableViewModeChange = (mode: TableViewMode) => {
+    try { localStorage.setItem(TABLE_VIEW_MODE_STORAGE_KEY, mode) } catch { /* storage is optional */ }
+    continuousPageRef.current = 1
+    continuousHasMoreRef.current = true
+    continuousLoadingRef.current = false
+    restoredScopeRef.current = null
+    setContinuousLoading(false)
+    setPage(1)
+    setTableViewMode(mode)
+  }
+
+  const handleRowHeightLimitChange = (limit: RowHeightLimit) => {
+    try { localStorage.setItem(ROW_HEIGHT_LIMIT_STORAGE_KEY, String(limit)) } catch { /* storage is optional */ }
+    setRowHeightLimit(limit)
+  }
+
+  const handleTableZoomChange = (zoom: number) => {
+    const next = Math.min(150, Math.max(75, zoom))
+    try { localStorage.setItem(TABLE_ZOOM_STORAGE_KEY, String(next)) } catch { /* storage is optional */ }
+    setTableZoom(next)
+  }
+
+  const loadRelationData = useCallback(async () => {
+    const relationFields = fields.filter(field => ['link', 'lookup', 'rollup'].includes(field.field_type))
+    const recordIds = patents.map(patent => patent.id)
+    if (relationFields.length === 0 || recordIds.length === 0) {
+      setRelationData({})
+      return
+    }
+    const entries = await Promise.all(relationFields.map(async field => {
+      try {
+        const result = await linkApi.batch(field.key, recordIds)
+        const byRecord: Record<number, RelationCellData> = {}
+        result.forEach(item => {
+          byRecord[item.record_id] = {
+            links: item.links,
+            value: item.value,
+            aggregation: item.aggregation,
+          }
+        })
+        return [field.key, byRecord] as const
+      } catch (error: unknown) {
+        console.error(`Failed to load relation field ${field.key}:`, error)
+        return [field.key, {}] as const
+      }
+    }))
+    setRelationData(Object.fromEntries(entries))
+  }, [fields, patents])
+
+  useEffect(() => {
+    // Relation values are loaded from the API when the visible records change.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadRelationData()
+  }, [loadRelationData])
+
+  const loadFields = useCallback(async (refresh = false) => {
+    try {
+      const fieldsData = await fieldApi.list(refresh)
+      // 保存视图有独立的字段投影；只有未进入视图时才应用旧的浏览器级配置。
+      // 这样一个视图隐藏字段不会影响其他视图，也不会把字段状态写回主数据。
+      if (viewId === null) {
+        try {
+          const hiddenRaw = localStorage.getItem('patwiki_hidden_fields')
+          if (hiddenRaw) {
+            const hiddenKeys: string[] = JSON.parse(hiddenRaw)
+            fieldsData.forEach(f => {
+              if (hiddenKeys.includes(f.key)) f.visible = false
+            })
+          }
+        } catch (error) { console.error('Failed to read hidden fields:', error) }
+      }
+      setFields(fieldsData)
+      try {
+        const savedOrder = JSON.parse(localStorage.getItem('patwiki_field_order') || '[]') as unknown
+        if (Array.isArray(savedOrder)) {
+          const orderMap = new Map(savedOrder.map((key, index) => [String(key), index]))
+          fieldsData.sort((a, b) => (orderMap.get(a.key) ?? Number.MAX_SAFE_INTEGER) - (orderMap.get(b.key) ?? Number.MAX_SAFE_INTEGER))
+          setFields([...fieldsData])
+        }
+      } catch { /* column order is optional */ }
+      try {
+        const savedFrozen = JSON.parse(localStorage.getItem('patwiki_frozen_fields') || 'null') as unknown
+        const frozen = Array.isArray(savedFrozen) ? savedFrozen.map(String) : []
+        setFrozenFields(new Set(frozen))
+      } catch {
+        setFrozenFields(new Set())
+      }
+      const widths: Record<string, number> = {}
+      fieldsData.forEach(f => {
+        widths[f.key] = f.width || DEFAULT_COLUMN_WIDTH
+      })
+      if (viewId === null) {
+        try {
+          const saved = JSON.parse(localStorage.getItem('patwiki_column_widths') || '{}') as Record<string, unknown>
+          Object.entries(saved).forEach(([key, value]) => {
+            if (typeof value === 'number' && value >= 80 && value <= 1200 && key in widths) widths[key] = value
+          })
+        } catch (error) { console.error('Failed to read column widths:', error) }
+      }
+      setColumnWidths(widths)
+    } catch (e) {
+      console.error('Failed to load fields:', e)
+    }
+  }, [viewId])
+
+  const loadCustomFields = useCallback(async () => {
+    try {
+      const cf = await customFieldApi.list()
+      setCustomFields(cf)
+    } catch (e) {
+      console.error('Failed to load custom fields:', e)
+    }
+  }, [])
+
+  const loadPatents = useCallback(async (
+    requestedPage = tableViewMode === 'continuous' ? 1 : page,
+    append = false,
+    requestedPageSize = pageSize,
+    preserveVisible = false,
+    replaceWindow = false,
+  ): Promise<boolean> => {
+    const myRequestId = ++loadPatentsRequestId.current
+    const effectivePage = requestedPage
+    // replaceWindow：原地替换可见窗口（删除行后的刷新）。不进入 loading 态、
+    // 不清空旧行、不重置滚动，表格始终保持挂载，滚动位置自然保留。
+    const keepVisible = preserveVisible || replaceWindow
+    if (!append) {
+      if (!keepVisible) setLoading(true)
+      if (!keepVisible) patentsRef.current = []
+      if (!keepVisible) {
+        continuousPageRef.current = effectivePage
+        continuousHasMoreRef.current = true
+        if (tableViewMode === 'continuous') tableWrapperRef.current?.scrollTo({ top: 0 })
+      }
+    }
+    const applyItems = (items: Patent[], total: number) => {
+      totalPatentsRef.current = total
+      if (!append && replaceWindow) {
+        patentsRef.current = items
+        setPatents(items, total)
+        saveTableDataSnapshot(tableScopeKey, {
+          items,
+          total,
+          continuousPage: continuousPageRef.current,
+          hasMore: items.length < total,
+          savedAt: Date.now(),
+        })
+        return
+      }
+      if (!append && !preserveVisible) {
+        patentsRef.current = items
+        setPatents(items, total)
+        saveTableDataSnapshot(tableScopeKey, {
+          items,
+          total,
+          continuousPage: continuousPageRef.current,
+          hasMore: items.length < total,
+          savedAt: Date.now(),
+        })
+        return
+      }
+      const incomingById = new Map(items.map(item => [item.id, item]))
+      // A refresh after an edit must not reorder the visible window when the
+      // edited value is also the active sort key. Replace rows in place and
+      // leave the window boundaries unchanged, as a spreadsheet would.
+      const merged = preserveVisible
+        ? patentsRef.current.map(item => incomingById.get(item.id) || item)
+        : Array.from(new Map([...patentsRef.current, ...items].map(item => [item.id, item])).values())
+      patentsRef.current = merged
+      setPatents(merged, total)
+      saveTableDataSnapshot(tableScopeKey, {
+        items: merged,
+        total,
+        continuousPage: continuousPageRef.current,
+        hasMore: merged.length < total,
+        savedAt: Date.now(),
+      })
+    }
+    try {
+      const viewFilters: JsonObject = {}
+      Object.entries(filterValues).forEach(([key, condition]) => {
+        if (filterConditionHasValue(condition)) viewFilters[key] = condition as unknown as JsonValue
+      })
+
+      let semanticFallback = false
+      if (searchText && searchMode !== 'keyword' && viewId === null) {
+        try {
+          const semanticResult = await semanticSearchService.query({
+            query: searchText,
+            database_id: isGlobalMasterTable ? undefined : activeDatabaseId ?? undefined,
+            mode: searchMode,
+            top_k: requestedPageSize,
+            include_explain: false,
+          })
+          if (myRequestId !== loadPatentsRequestId.current) return false
+          const reasons = semanticResult.meta.degraded_reasons || []
+          if (reasons.includes('SEMANTIC_INDEX_NOT_READY')) {
+            setSemanticNotice('尚未完成向量化，当前显示关键词结果；请到管理 > 语义检索开始向量化')
+          } else if (semanticResult.meta.degraded) {
+            setSemanticNotice('语义服务暂不可用，当前显示关键词结果')
+          } else {
+            setSemanticNotice(`当前为${searchMode === 'hybrid' ? '混合检索' : '语义检索'}结果`)
+          }
+          applyItems(semanticResult.items.map(item => item.patent), semanticResult.items.length)
+          return true
+        } catch (error: unknown) {
+          console.error('Semantic search failed, falling back to keyword search:', error)
+          semanticFallback = true
+          setSemanticNotice('语义服务暂不可用，已切换到关键词检索')
+        }
+      }
+      if (searchMode !== 'keyword' && viewId !== null && !semanticFallback) setSemanticNotice('当前视图使用关键词筛选；语义检索请切换至主表')
+      else if (!semanticFallback) setSemanticNotice('')
+
+      // 视图查询路径：仅当 viewId 与当前库匹配时才走视图接口。
+      // 若视图尚未加载完成（views 为旧库数据）或 viewId 与当前库不一致，
+      // 不再清空表格——而是降级走大表直查，避免“切库/翻页后数据消失”。
+      // 这样在 loadViews 异步加载新视图的间隙，用户仍能看到目标库的数据。
+      if (viewId !== null) {
+        const activeViewForLoad = viewsRef.current.find(view => view.id === viewId)
+        const viewMatchesDb = !!activeViewForLoad && activeViewForLoad.database_id === activeDatabaseId
+        if (viewMatchesDb) {
+          if (activeViewForLoad?.layout_type === 'kanban') {
+            setGroupedGroups([])
+            setPatents([], 0)
+            return true
+          }
+          const groupFields = getViewGroupFields(activeViewForLoad!)
+          if (groupFields.length > 0 && !groupByFamily && !append && tableViewMode !== 'continuous') {
+            const result = await viewApi.grouped(viewId, {
+              page: effectivePage,
+              page_size: requestedPageSize,
+              search: searchText || undefined,
+              sort_by: sortField,
+              sort_order: sortOrder,
+              group_by_family: groupByFamily,
+              extra_filters: viewFilters,
+            })
+            if (myRequestId !== loadPatentsRequestId.current) return false
+            setGroupedGroups(result.groups)
+            setCollapsedGroupKeys(new Set(getDefaultCollapsedKeys(result.groups)))
+            applyItems(flattenGroups(result.groups), result.total)
+            return true
+          }
+          if (!append) {
+            setGroupedGroups([])
+            setCollapsedGroupKeys(new Set())
+          }
+          const result = await viewApi.listPatents(viewId, {
+            page: effectivePage,
+            page_size: requestedPageSize,
+            search: searchText || undefined,
+            sort_by: sortField,
+            sort_order: sortOrder,
+            group_by_family: groupByFamily,
+            // 连续滚动走的是普通列表接口（跳过分组接口），这里要求后端按
+            // 视图分组字段排序，使行顺序与分页/详情/全图（分组接口）一致。
+            order_by_view_grouping: true,
+            extra_filters: viewFilters,
+          })
+          if (myRequestId !== loadPatentsRequestId.current) return false
+          applyItems(result.items as Patent[], result.total)
+          return true
+        }
+        // 视图不匹配：降级到大表直查，避免数据消失
+      }
+
+      const params: JsonObject = {
+        page: effectivePage,
+        page_size: requestedPageSize,
+        sort_by: sortField,
+        sort_order: sortOrder,
+      }
+      if (searchText) params.search = searchText
+      if (!isGlobalMasterTable && activeDatabaseId !== null && activeDatabaseId !== undefined) {
+        params.database_id = activeDatabaseId
+      }
+      if (currentProductId) params.product_id = currentProductId
+      // 大表直查（无产品筛选）时透传同族聚拢开关
+      if (groupByFamily) {
+        params.group_by_family = true
+      }
+
+      const allFilters: JsonObject = {}
+      Object.entries(filterValues).forEach(([key, condition]) => {
+        if (filterConditionHasValue(condition)) allFilters[key] = condition as unknown as JsonValue
+      })
+      if (Object.keys(allFilters).length > 0) {
+        params.filters = JSON.stringify(allFilters)
+      }
+
+      const result = await patentApi.list(params)
+      if (myRequestId !== loadPatentsRequestId.current) return false
+      applyItems(result.items, result.total)
+      return true
+    } catch (e) {
+      if (myRequestId !== loadPatentsRequestId.current) return false
+      console.error('Failed to load patents:', e)
+      return false
+    } finally {
+      if (myRequestId === loadPatentsRequestId.current) setLoading(false)
+    }
+  }, [page, pageSize, searchText, searchMode, currentProductId, activeDatabaseId, isGlobalMasterTable, sortField, sortOrder, filterValues, groupByFamily, tableViewMode, viewId, tableScopeKey, setPatents, setLoading])
+
+  const loadNextContinuousPage = useCallback(() => {
+    if (tableViewMode !== 'continuous' || continuousLoadingRef.current || !continuousHasMoreRef.current) return
+    const total = totalPatentsRef.current
+    if (total <= 0 || patentsRef.current.length >= total) {
+      continuousHasMoreRef.current = false
+      return
+    }
+
+    const nextPage = continuousPageRef.current + 1
+    continuousLoadingRef.current = true
+    setContinuousLoading(true)
+    void loadPatents(nextPage, true).then(success => {
+      if (success) {
+        continuousPageRef.current = nextPage
+        continuousHasMoreRef.current = patentsRef.current.length < totalPatentsRef.current
+      } else {
+        continuousHasMoreRef.current = false
+      }
+    }).finally(() => {
+      continuousLoadingRef.current = false
+      setContinuousLoading(false)
+    })
+  }, [loadPatents, tableViewMode])
+
+  const handleTableScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    setActiveHeaderMenu(null)
+    const element = event.currentTarget
+    try {
+      sessionStorage.setItem(tableScopeKey, JSON.stringify({
+        page,
+        continuousPage: continuousPageRef.current,
+        scrollTop: element.scrollTop,
+        scrollLeft: element.scrollLeft,
+        savedAt: Date.now(),
+      } satisfies TablePositionSnapshot))
+    } catch { /* session storage is optional */ }
+    updateScrollEdges(element)
+    if (tableViewMode !== 'continuous') return
+    const remaining = element.scrollHeight - element.scrollTop - element.clientHeight
+    if (remaining < 320) loadNextContinuousPage()
+  }
+
+  const restoreContinuousPosition = useCallback(async (snapshot: TablePositionSnapshot | null) => {
+    const targetPage = Math.max(1, Math.min(snapshot?.continuousPage || 1, 2000))
+    const targetRowCount = targetPage * pageSize
+    const chunkSize = 1000
+    // The API caps one response at 1,000 rows. Replay in bounded chunks so
+    // returning from a deep detail view never silently stops at the first
+    // 1,000 filtered records.
+    const firstPageSize = Math.min(targetRowCount, chunkSize)
+    const firstPageLoaded = await loadPatents(1, false, firstPageSize)
+    if (!firstPageLoaded) return
+    let nextBackendPage = 2
+    let previousLoadedCount = patentsRef.current.length
+    while (patentsRef.current.length < targetRowCount && nextBackendPage <= 2000) {
+      const loaded = await loadPatents(nextBackendPage, true, chunkSize)
+      if (!loaded || patentsRef.current.length <= previousLoadedCount) break
+      previousLoadedCount = patentsRef.current.length
+      nextBackendPage += 1
+    }
+    continuousPageRef.current = Math.max(1, Math.ceil(patentsRef.current.length / pageSize))
+    continuousHasMoreRef.current = patentsRef.current.length < totalPatentsRef.current
+    if (snapshot) {
+      window.requestAnimationFrame(() => {
+        const element = tableWrapperRef.current
+        if (!element) return
+        element.scrollLeft = snapshot.scrollLeft
+        element.scrollTop = snapshot.scrollTop
+      })
+    }
+  }, [loadPatents, pageSize])
+
+  // Browser back/forward rehydrates list state from the URL.
+  useEffect(() => {
+    const params = new URLSearchParams(searchParamsString)
+    const urlProductId = Number(params.get('product'))
+    if (params.has('product') && Number.isInteger(urlProductId) && urlProductId > 0 && urlProductId !== currentProductId) {
+      setCurrentProductId(urlProductId)
+    }
+    const urlFamily = params.get('family') === '1'
+    // 仅在 URL 明确携带开关时覆盖本地持久化偏好；切库/切视图的 URL
+    // 短暂缺少 family 参数时不能把用户已开启的同族聚拢重置掉。
+    if (params.has('family') && urlFamily !== groupByFamily) setGroupByFamily(urlFamily)
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPage(readPageParam(params))
+    setSearchText(params.get('q') || '')
+    setSearchInputText(params.get('q') || '')
+    const mode = params.get('search_mode')
+    setSearchMode(mode === 'keyword' || mode === 'semantic' || mode === 'hybrid' ? mode : 'hybrid')
+    setSortField(params.get('sort') || 'filing_date')
+    setSortOrder(params.get('order') === 'asc' ? 'asc' : 'desc')
+    setFilterValues(readFilterParam(params))
+  }, [currentProductId, groupByFamily, searchParamsString, setCurrentProductId, setGroupByFamily])
+
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams)
+    const setOrDelete = (key: string, value: string | null) => {
+      if (value) next.set(key, value)
+      else next.delete(key)
+    }
+    setOrDelete('db', isGlobalMasterTable || activeDatabaseId === null ? null : String(activeDatabaseId))
+    setOrDelete('view', isGlobalMasterTable || viewId === null ? null : String(viewId))
+    setOrDelete('product', currentProductId === null ? null : String(currentProductId))
+    setOrDelete('q', searchText.trim() || null)
+    setOrDelete('search_mode', searchMode === 'hybrid' ? null : searchMode)
+    setOrDelete('page', page > 1 ? String(page) : null)
+    setOrDelete('sort', sortField !== 'filing_date' ? sortField : null)
+    setOrDelete('order', sortOrder !== 'desc' ? sortOrder : null)
+    setOrDelete('family', groupByFamily ? '1' : null)
+    setOrDelete('filters', Object.keys(filterValues).length > 0 ? JSON.stringify(filterValues) : null)
+    if (next.toString() !== searchParamsString) setSearchParams(next, { replace: true })
+  }, [activeDatabaseId, currentProductId, filterValues, groupByFamily, isGlobalMasterTable, page, searchParams, searchParamsString, searchText, searchMode, setSearchParams, sortField, sortOrder, viewId])
+
+  const saveViewColumnConfig = useCallback(async (columnConfig: ViewColumnConfig[]) => {
+    if (!activeView) return
+    const updated = await viewApi.update(activeView.id, { column_config: columnConfig })
+    const nextViews = viewsRef.current.map(view => view.id === updated.id ? updated : view)
+    viewsRef.current = nextViews
+    setViews(nextViews)
+    const widths: Record<string, number> = {}
+    columnConfig.forEach(column => {
+      if (column.width) widths[column.key] = column.width
+    })
+    setColumnWidths(previous => ({ ...previous, ...widths }))
+    setViewConfigNotice('当前视图列配置已保存')
+    window.setTimeout(() => setViewConfigNotice(''), 3000)
+    await loadPatents()
+  }, [activeView, loadPatents, setViews])
+
+  useEffect(() => {
+    if (!activeView?.column_config) return
+    const configuredWidths: Record<string, number> = {}
+    activeView.column_config.forEach(column => {
+      if (column.width) configuredWidths[column.key] = column.width
+    })
+    // View configuration is external state loaded asynchronously after the field registry.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setColumnWidths(previous => ({ ...previous, ...configuredWidths }))
+  }, [activeView])
+
+  useEffect(() => {
+    // Field metadata is loaded asynchronously when the page mounts.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadFields()
+    void loadCustomFields()
+  }, [loadFields, loadCustomFields])
+
+  useEffect(() => {
+    // Imports and field-management changes alter the column registry. Reload it
+    // before the refreshed records render so mapped fields appear in the grid.
+    if (dataVersion > 0) {
+      // The registry refresh is an external synchronization triggered by import/field changes.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      void loadFields(true)
+      void loadCustomFields()
+    }
+  }, [dataVersion, loadCustomFields, loadFields])
+
+  // 打开批量打标签弹窗时加载标签列表
+  useEffect(() => {
+    if (!showBulkTag) return
+    if (tagsList.length > 0) return
+    // Loading state begins an asynchronous request and is intentionally local to this effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setBulkTagLoading(true)
+    tagApi.list().then(setTagsList).catch(console.error).finally(() => setBulkTagLoading(false))
+  }, [showBulkTag, tagsList.length])
+
+  useEffect(() => {
+    if (fields.length > 0) {
+      const cached = tableDataCache.get(tableScopeKey)
+      const position = readTablePosition()
+      // 空快照一律视为未命中：否则一次竞态写回的“空结果”会被缓存到当前
+      // scope，之后切回同一库/同一筛选条件时命中缓存直接渲染空表，而且不再
+      // 触发请求——必须点别处才能刷新。空库最多多发一次请求，代价可接受。
+      if (cached && cached.items.length > 0) {
+        patentsRef.current = cached.items
+        totalPatentsRef.current = cached.total
+        continuousPageRef.current = cached.continuousPage
+        continuousHasMoreRef.current = cached.hasMore
+        restoredScopeRef.current = tableScopeKey
+        // The store update is intentionally synchronous with the cache hit so
+        // the table never flashes an empty loading state after detail->back.
+        setPatents(cached.items, cached.total)
+        window.requestAnimationFrame(() => {
+          const element = tableWrapperRef.current
+          if (!element || !position) return
+          element.scrollLeft = position.scrollLeft
+          element.scrollTop = position.scrollTop
+        })
+        // Refresh only the loaded window and keep cached rows visible while it
+        // is in flight. A fresh cache is already the latest list response.
+        if (tableViewMode !== 'continuous' && Date.now() - cached.savedAt > 15000) {
+          window.setTimeout(() => {
+            void loadPatents(
+              page,
+              false,
+              Math.min(cached.items.length || pageSize, 1000),
+              true,
+            )
+          }, 0)
+        }
+        return
+      }
+      if (tableViewMode === 'continuous') {
+        if (restoredScopeRef.current === tableScopeKey) return
+        restoredScopeRef.current = tableScopeKey
+        // Restore the loaded page count before restoring scrollTop. This keeps
+        // the same filtered rows available when returning from a detail page.
+        void restoreContinuousPosition(readTablePosition())
+        return
+      }
+      const snapshot = position
+      // Loading the external table source also updates the loading and patent stores.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      void loadPatents(page, false).then(success => {
+        if (!success || !snapshot) return
+        window.requestAnimationFrame(() => {
+          const element = tableWrapperRef.current
+          if (!element) return
+          element.scrollLeft = snapshot.scrollLeft
+          element.scrollTop = snapshot.scrollTop
+        })
+      })
+    }
+  }, [fields.length, loadPatents, page, pageSize, readTablePosition, restoreContinuousPosition, setPatents, tableScopeKey, tableViewMode])
+
+  useEffect(() => {
+    // Reset selection and pagination when the active data scope changes.
+    clearSelection()
+    // The history belongs to the active database/view scope.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setUndoStack([])
+    setRedoStack([])
+    setPage(1)
+    restoredScopeRef.current = null
+    setActiveCell(null)
+  }, [viewId, activeDatabaseId, clearSelection])
+
+  useEffect(() => {
+    // Keep the input display in sync with pagination state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPageInputValue(String(page))
+  }, [page])
+
+  useEffect(() => {
+    const query = searchInputText.trim()
+    if (query.length < 2) return
+
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void searchApi.suggest(query, isGlobalMasterTable ? null : activeDatabaseId).then(items => {
+        if (!cancelled) {
+          setSearchSuggestions(items)
+          setActiveSuggestionIndex(-1)
+        }
+      }).catch(error => {
+        if (!cancelled) {
+          console.error('Failed to load search suggestions:', error)
+          setSearchSuggestions([])
+        }
+      })
+    }, 220)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [activeDatabaseId, isGlobalMasterTable, searchInputText])
+
+  useEffect(() => {
+    const handlePointerMove = (e: PointerEvent) => {
+      if (resizing) {
+        const diff = e.clientX - resizing.startX
+        const newWidth = Math.max(80, resizing.startWidth + diff)
+        setColumnWidths(prev => ({ ...prev, [resizing.fieldKey]: newWidth }))
+      }
+    }
+    const handlePointerUp = () => {
+      if (resizing) {
+        setColumnWidths(widths => {
+          if (activeView) {
+            const configured = activeView.column_config || []
+            const nextConfig: ViewColumnConfig[] = (configured.length > 0 ? configured : fields.map((field, order) => ({
+              key: field.key,
+              visible: field.visible !== false,
+              width: field.width || DEFAULT_COLUMN_WIDTH,
+              order,
+            }))).map(column => ({
+              ...column,
+              width: widths[column.key] || column.width || DEFAULT_COLUMN_WIDTH,
+            }))
+            void saveViewColumnConfig(nextConfig)
+          } else {
+            try { localStorage.setItem('patwiki_column_widths', JSON.stringify(widths)) } catch (error) { console.error('Failed to save column widths:', error) }
+          }
+          return widths
+        })
+      }
+      setResizing(null)
+    }
+    if (resizing) {
+      document.addEventListener('pointermove', handlePointerMove)
+      document.addEventListener('pointerup', handlePointerUp)
+      document.addEventListener('pointercancel', handlePointerUp)
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+    }
+    return () => {
+      document.removeEventListener('pointermove', handlePointerMove)
+      document.removeEventListener('pointerup', handlePointerUp)
+      document.removeEventListener('pointercancel', handlePointerUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+  }, [activeView, fields, resizing, saveViewColumnConfig])
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (activeHeaderMenu) {
+        const target = e.target as HTMLElement
+        if (!target.closest('.col-header-menu') && !target.closest('.col-header-trigger')) {
+          setActiveHeaderMenu(null)
+          setHeaderFilterText('')
+        }
+      }
+    }
+    document.addEventListener('click', handleClickOutside)
+    return () => document.removeEventListener('click', handleClickOutside)
+  }, [activeHeaderMenu])
+
+  // 右键菜单：点击其他位置或按 Esc 关闭
+  useEffect(() => {
+    if (!contextMenu) return
+    const close = () => setContextMenu(null)
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
+    const onClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement
+      if (!target.closest('.context-menu')) close()
+    }
+    document.addEventListener('click', onClick)
+    const onContextMenu = (e: MouseEvent) => {
+      // 在菜单已打开时，右键其他位置应直接切换菜单位置而不是叠加
+      const target = e.target as HTMLElement
+      if (!target.closest('.context-menu')) {
+        // 让目标元素的 onContextMenu 重新接管
+        close()
+      }
+    }
+    document.addEventListener('contextmenu', onContextMenu)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('click', onClick)
+      document.removeEventListener('contextmenu', onContextMenu)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [contextMenu])
+
+  // 表头勾选范围菜单：点击其他位置或按 Esc 关闭
+  useEffect(() => {
+    if (!selectScopeMenu) return
+    const onClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement
+      if (!target.closest('.select-scope-menu')) setSelectScopeMenu(null)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setSelectScopeMenu(null) }
+    document.addEventListener('click', onClick)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('click', onClick)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [selectScopeMenu])
+
+  const handleSearch = (e: React.FormEvent) => {
+    e.preventDefault()
+    setSearchText(searchInputText)
+    setSearchSuggestions([])
+    setActiveSuggestionIndex(-1)
+    setPage(1)
+  }
+
+  const handleSearchInputChange = (value: string) => {
+    setSearchInputText(value)
+    setSearchSuggestions([])
+    setActiveSuggestionIndex(-1)
+  }
+
+  const applySearchSuggestion = (suggestion: SearchSuggestion) => {
+    setSearchInputText(suggestion.value)
+    setSearchText(suggestion.value)
+    setSearchSuggestions([])
+    setActiveSuggestionIndex(-1)
+    setPage(1)
+  }
+
+  const handleSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Escape') {
+      setSearchSuggestions([])
+      setActiveSuggestionIndex(-1)
+      return
+    }
+    if (searchSuggestions.length === 0) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setActiveSuggestionIndex(index => (index + 1) % searchSuggestions.length)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setActiveSuggestionIndex(index => index <= 0 ? searchSuggestions.length - 1 : index - 1)
+    } else if (event.key === 'Enter' && activeSuggestionIndex >= 0) {
+      event.preventDefault()
+      applySearchSuggestion(searchSuggestions[activeSuggestionIndex])
+    }
+  }
+
+  const handleExport = () => setShowExportDialog(true)
+
+  const handleFamilyGrouping = async () => {
+    const nextValue = !groupByFamily
+    if (nextValue && activeDatabaseId) {
+      try {
+        const result = await patentApi.rebuildFamilies(activeDatabaseId)
+        setViewConfigNotice(`已重建 ${result.family_count} 个同族组，覆盖 ${result.grouped_patent_count} 件专利`)
+        setCollapsedFamilyKeys(new Set())
+        setGroupedGroups([])
+        await loadPatents(1, false, pageSize, true)
+      } catch (error: unknown) {
+        setViewConfigNotice(getErrorMessage(error, '同族关系重建失败'))
+      }
+    }
+    setGroupByFamily(nextValue)
+    setPage(1)
+  }
+
+  // 主表默认开启同族聚拢时，切入一个尚未建立族关系的数据库也要先完成
+  // 一次重建，否则接口虽收到 group_by_family=true 仍没有可聚拢的 family_id。
+  useEffect(() => {
+    if (!groupByFamily || !activeDatabaseId || familyRebuildDatabaseRef.current === activeDatabaseId) return
+    familyRebuildDatabaseRef.current = activeDatabaseId
+    void patentApi.rebuildFamilies(activeDatabaseId).then(() => {
+      setCollapsedFamilyKeys(new Set())
+      setGroupedGroups([])
+      // 切库后重建同族时不能用 preserveVisible：该模式下 applyItems 会把响应
+      // 合并进“当前可见窗口”，而切库瞬间 patentsRef 可能刚被清空或仍是旧库数据，
+      // 于是会写回空结果并缓存到当前 scope，表现为“切库后一直没有数据，点一下
+      // 其它切换按钮才刷新出来”。这里按切库处理，整窗替换为响应结果。
+      return loadPatents(1, false, pageSize, false)
+    }).catch(error => {
+      familyRebuildDatabaseRef.current = null
+      console.error('Failed to rebuild family relations:', error)
+    })
+  }, [activeDatabaseId, groupByFamily, loadPatents, pageSize])
+
+  const refreshAfterDeletion = async (deletedIds: number[] = []) => {
+    if (deletedIds.length > 0) {
+      const deleted = new Set(deletedIds)
+      patentsRef.current = patentsRef.current.filter(item => !deleted.has(item.id))
+      setPatents(patentsRef.current, Math.max(0, totalPatentsRef.current - deleted.size))
+    }
+    // 删除会改变库内总数：侧边栏等处读取的是 databases[].patent_count，
+    // 若不回写就会出现“表格已少一条、侧边栏仍是旧数字”的不一致。
+    if (activeDatabaseId != null && Number.isInteger(activeDatabaseId) && activeDatabaseId > 0) {
+      try {
+        const { patent_count } = await databaseApi.refreshCount(activeDatabaseId)
+        setDatabases(databases.map(db => db.id === activeDatabaseId ? { ...db, patent_count } : db))
+      } catch (error) {
+        // 计数刷新失败不应把一次成功的删除变成报错，记录后继续。
+        console.error('Failed to refresh database count after deletion:', error)
+      }
+    }
+    if (groupByFamily && activeDatabaseId) {
+      try {
+        // 后端 rebuild 现在会复用既有族（family_id 保持稳定），因此这里
+        // 不再重置 collapsedFamilyKeys，折叠状态跨删除保留。
+        await patentApi.rebuildFamilies(activeDatabaseId)
+      } catch (error) {
+        // The record is already deleted; a transient family rebuild failure
+        // must not turn a successful delete into a misleading error.
+        console.error('Failed to rebuild family relations after deletion:', error)
+      }
+    }
+    if (tableViewMode === 'continuous') {
+      // 连续模式下原地重载已加载的窗口：先整窗替换（不卸载表格），再分块
+      // 追加补足原有行数。表格全程保持挂载，滚动位置自然停留在原地。
+      const targetRowCount = patentsRef.current.length + deletedIds.length
+      const chunkSize = 1000
+      const first = await loadPatents(1, false, Math.min(Math.max(targetRowCount, 1), chunkSize), false, true)
+      if (!first) return
+      let nextBackendPage = 2
+      let previousLoadedCount = patentsRef.current.length
+      while (patentsRef.current.length < targetRowCount && patentsRef.current.length < totalPatentsRef.current) {
+        const loaded = await loadPatents(nextBackendPage, true, chunkSize)
+        if (!loaded || patentsRef.current.length <= previousLoadedCount) break
+        previousLoadedCount = patentsRef.current.length
+        nextBackendPage += 1
+        if (nextBackendPage > 2000) break
+      }
+      continuousPageRef.current = Math.max(1, Math.ceil(patentsRef.current.length / pageSize))
+      continuousHasMoreRef.current = patentsRef.current.length < totalPatentsRef.current
+      return
+    }
+    // 分页模式：replaceWindow 原地替换当前页，不触发 loading 骨架，
+    // 浏览器不会因内容收缩而把 scrollTop 归零。
+    const loaded = await loadPatents(page, false, pageSize, false, true)
+    if (!loaded) return
+    // A full page can become empty after deleting its last row.
+    if (page > 1 && totalPatentsRef.current <= (page - 1) * pageSize) {
+      setPage(page - 1)
+    }
+  }
+
+  // 批量删除选中的专利
+  const handleBulkDelete = async () => {
+    if (selectedIds.length === 0) return
+    if (!confirm(`确定要删除选中的 ${selectedIds.length} 条专利吗？此操作不可恢复！`)) return
+    try {
+      const result = await patentApi.bulkDelete(selectedIds)
+      alert(`已删除 ${result.deleted_count} 条专利`)
+      clearSelection()
+      await refreshAfterDeletion(selectedIds)
+    } catch (error: unknown) {
+      alert(getErrorMessage(error, '删除失败'))
+    }
+  }
+
+  // 清空当前库内的全部专利（保留库本身，用于主表/默认库等不可删除的库）
+  const handleClearDatabase = async () => {
+    if (activeDatabaseId == null || !Number.isInteger(activeDatabaseId) || activeDatabaseId <= 0) {
+      alert('当前没有明确的数据库范围，操作已取消')
+      return
+    }
+    if (clearingDatabase) return
+    setClearingDatabase(true)
+    try {
+      const result = await databaseApi.clearPatents(activeDatabaseId)
+      clearSelection()
+      setShowClearDatabase(false)
+      await refreshAfterDeletion()
+      alert(`已清空 ${result.deleted_count} 条专利`)
+    } catch (error: unknown) {
+      alert(getErrorMessage(error, '清空失败'))
+    } finally {
+      setClearingDatabase(false)
+    }
+  }
+
+  const openBulkTransfer = (action: BulkTransferAction) => {
+    setBulkTransferAction(action)
+    setBulkTargetDatabaseId(action === 'duplicate' ? activeDatabaseId ?? null : null)
+    setBulkTargetViewId(null)
+  }
+
+  const handleBulkTransfer = async () => {
+    if (!bulkTransferAction || selectedIds.length === 0) return
+    if (activeDatabaseId == null || !Number.isInteger(activeDatabaseId) || activeDatabaseId <= 0) {
+      alert('当前没有明确的数据库范围，批量操作已取消')
+      return
+    }
+    const sourceDatabaseId = activeDatabaseId
+    try {
+      if (bulkTransferAction === 'move_database') {
+        if (bulkTargetDatabaseId == null) {
+          alert('请选择目标数据库')
+          return
+        }
+        const result = await patentApi.bulkMoveDatabase(selectedIds, bulkTargetDatabaseId, {
+          sourceDatabaseId,
+          sourceViewId: viewId ?? null,
+        })
+        alert(`已移库 ${result.moved_count} 条专利`)
+      } else if (bulkTransferAction === 'move_view') {
+        const result = await patentApi.bulkMoveView(selectedIds, bulkTargetViewId, {
+          sourceDatabaseId,
+          sourceViewId: viewId ?? null,
+        })
+        alert(result.target_view_id == null ? `已将 ${result.moved_count} 条专利移回库主表` : `已移动 ${result.moved_count} 条专利到目标视图`)
+      } else {
+        const options = bulkTargetDatabaseId == null ? {} : { target_database_id: bulkTargetDatabaseId }
+        const result = await patentApi.bulkDuplicate(selectedIds, options)
+        alert(`已创建 ${result.created_count} 条工作副本。副本不带官方号码，不会与原专利混淆。`)
+      }
+      setBulkTransferAction(null)
+      clearSelection()
+      await loadPatents()
+    } catch (error: unknown) {
+      alert('批量操作失败: ' + getErrorMessage(error))
+    }
+  }
+
+  const handleSelectAll = (e: React.ChangeEvent<HTMLInputElement>) => {
+    // 表头复选框只切换当前页；整库范围由旁边的范围菜单选择。
+    if (e.target.checked) {
+      selectCurrentPage()
+    } else {
+      clearSelection()
+    }
+  }
+
+  // 表头勾选范围菜单
+  const handleHeaderSelectClick = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (selectScopeMenu) {
+      setSelectScopeMenu(null)
+    } else {
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+      setSelectScopeMenu({ x: rect.left, y: rect.bottom + 4 })
+    }
+  }
+
+  const handleSort = (fieldKey: string) => {
+    const field = fields.find(f => f.key === fieldKey)
+    if (!field?.sortable) return
+    if (sortField === fieldKey) {
+      setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortField(fieldKey)
+      setSortOrder('desc')
+    }
+    setActiveHeaderMenu(null)
+  }
+
+  const handleCellClick = (patentId: number, fieldKey: string, e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest('.cell-action-btn')) return
+    const field = fields.find(f => f.key === fieldKey)
+    if (!field?.editable || field.field_type === 'lookup' || field.field_type === 'rollup') {
+      openPatent(patentId)
+      return
+    }
+    if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'SELECT') {
+      return
+    }
+    setEditingCell({ patentId, fieldKey })
+  }
+
+  const handlePatentReferenceClick = useCallback(async (publicationNumber: string) => {
+    try {
+      const result = await patentApi.resolvePublicationNumber(publicationNumber)
+      if (result.found && result.patent_id) {
+        openPatent(result.patent_id)
+        return
+      }
+      alert(`库中未找到公开号 ${publicationNumber}`)
+    } catch (error: unknown) {
+      alert('解析专利公开号失败: ' + getErrorMessage(error))
+    }
+  }, [openPatent])
+
+  const applyLocalCellValue = (patentId: number, fieldKey: string, value: JsonValue) => {
+    const fieldMeta = fields.find(field => field.key === fieldKey)
+    const isCustomField = fieldKey.startsWith('custom_fields.') || fieldMeta?.is_system === false
+    const customKey = fieldKey.startsWith('custom_fields.') ? fieldKey.slice('custom_fields.'.length) : fieldKey
+    const nextPatents = patentsRef.current.map(item => item.id === patentId
+      ? (isCustomField
+        ? { ...item, custom_fields: { ...(item.custom_fields || {}), [customKey]: value } }
+        : { ...item, [fieldKey]: value } as Patent)
+      : item)
+    patentsRef.current = nextPatents
+    setPatents(nextPatents, totalPatentsRef.current)
+  }
+
+  const handleCellSave = async (patentId: number, fieldKey: string, value: JsonValue) => {
+    const before = getFieldValue(patents.find(patent => patent.id === patentId) || ({} as Patent), fieldKey)
+    if (JSON.stringify(before) === JSON.stringify(value)) {
+      setEditingCell(null)
+      return
+    }
+    // 空白单元格首次录入不需要确认；覆盖已有内容每次都确认。
+    const beforeIsEmpty = before === null || before === undefined || before === ''
+    if (!beforeIsEmpty && !window.confirm('确认覆盖此单元格的现有内容并保存吗？')) return
+    try {
+      if (viewId !== null) {
+        await viewApi.updateSharedField(viewId, patentId, fieldKey, value)
+      } else {
+        await patentApi.updateCell(patentId, fieldKey, value)
+      }
+      setEditingCell(null)
+      setUndoStack(prev => [...prev.slice(-49), { patentId, fieldKey, before, after: value }])
+      setRedoStack([])
+      applyLocalCellValue(patentId, fieldKey, value)
+    } catch (error: unknown) {
+      alert('保存失败: ' + getErrorMessage(error))
+    }
+  }
+
+  const handleToggleFieldVisible = (fieldKey: string) => {
+    if (activeView) {
+      const next = buildViewColumnConfig(activeView, fields).map(column =>
+        column.key === fieldKey ? { ...column, visible: column.visible === false } : column,
+      )
+      void saveViewColumnConfig(next).catch(error => alert('视图列配置保存失败: ' + getErrorMessage(error)))
+      setActiveHeaderMenu(null)
+      return
+    }
+    setFields(prev => {
+      const next = prev.map(f =>
+        f.key === fieldKey ? { ...f, visible: f.visible === false } : f
+      )
+      // localStorage 持久化
+      try {
+        const hidden = next.filter(f => f.visible === false).map(f => f.key)
+        localStorage.setItem('patwiki_hidden_fields', JSON.stringify(hidden))
+      } catch (error) { console.error('Failed to save hidden fields:', error) }
+      return next
+    })
+    setActiveHeaderMenu(null)
+  }
+
+  const handleHeaderFilterApply = (fieldKey: string) => {
+    if (headerFilterOperator !== 'is_empty' && headerFilterOperator !== 'is_not_empty' && !headerFilterText.trim()) {
+      handleHeaderFilterClear(fieldKey)
+      return
+    }
+    setFilterValues(prev => ({
+      ...prev,
+      [fieldKey]: {
+        operator: headerFilterOperator,
+        ...(headerFilterOperator === 'is_empty' || headerFilterOperator === 'is_not_empty'
+          ? {}
+          : { value: headerFilterText.trim() }),
+      },
+    }))
+    setPage(1)
+    setActiveHeaderMenu(null)
+    setHeaderFilterText('')
+    setHeaderFilterOperator('contains')
+  }
+
+  const handleHeaderFilterClear = (fieldKey: string) => {
+    setFilterValues(prev => {
+      const next = { ...prev }
+      delete next[fieldKey]
+      return next
+    })
+    setHeaderFilterText('')
+    setHeaderFilterOperator('contains')
+    setPage(1)
+  }
+
+  const handleClearAllFilters = () => {
+    setFilterValues({})
+    setSearchText('')
+    setSearchInputText('')
+    setSearchSuggestions([])
+    setActiveSuggestionIndex(-1)
+    setPage(1)
+  }
+
+  const applyEditCommand = async (command: { patentId: number; fieldKey: string; before: JsonValue; after: JsonValue }, value: JsonValue) => {
+    if (viewId !== null) await viewApi.updateSharedField(viewId, command.patentId, command.fieldKey, value)
+    else await patentApi.updateCell(command.patentId, command.fieldKey, value)
+  }
+
+  const handleUndo = async () => {
+    if (columnUndo) {
+      try {
+        if (columnUndo.viewId !== null && columnUndo.beforeConfig) {
+          const updated = await viewApi.update(columnUndo.viewId, { column_config: columnUndo.beforeConfig })
+          setViews(viewsRef.current.map(view => view.id === updated.id ? updated : view))
+          viewsRef.current = viewsRef.current.map(view => view.id === updated.id ? updated : view)
+        } else {
+          setFields(columnUndo.beforeFields)
+          try { localStorage.setItem('patwiki_field_order', JSON.stringify(columnUndo.beforeFields.map(field => field.key))) } catch { /* storage is optional */ }
+        }
+        setColumnRedo(columnUndo)
+        setColumnUndo(null)
+      } catch (error: unknown) { alert('撤回列删除失败: ' + getErrorMessage(error)) }
+      return
+    }
+    const command = undoStack[undoStack.length - 1]
+    if (!command) return
+    try {
+      await applyEditCommand(command, command.before)
+      setUndoStack(prev => prev.slice(0, -1))
+      setRedoStack(prev => [...prev, command])
+      applyLocalCellValue(command.patentId, command.fieldKey, command.before)
+    } catch (error: unknown) { alert('撤回失败: ' + getErrorMessage(error)) }
+  }
+
+  const handleRedo = async () => {
+    if (columnRedo) {
+      try {
+        if (columnRedo.viewId !== null && columnRedo.afterConfig) {
+          const updated = await viewApi.update(columnRedo.viewId, { column_config: columnRedo.afterConfig })
+          setViews(viewsRef.current.map(view => view.id === updated.id ? updated : view))
+          viewsRef.current = viewsRef.current.map(view => view.id === updated.id ? updated : view)
+        } else {
+          setFields(columnRedo.afterFields)
+          try { localStorage.setItem('patwiki_field_order', JSON.stringify(columnRedo.afterFields.map(field => field.key))) } catch { /* storage is optional */ }
+        }
+        setColumnUndo(columnRedo)
+        setColumnRedo(null)
+      } catch (error: unknown) { alert('重做列删除失败: ' + getErrorMessage(error)) }
+      return
+    }
+    const command = redoStack[redoStack.length - 1]
+    if (!command) return
+    try {
+      await applyEditCommand(command, command.after)
+      setRedoStack(prev => prev.slice(0, -1))
+      setUndoStack(prev => [...prev, command])
+      applyLocalCellValue(command.patentId, command.fieldKey, command.after)
+    } catch (error: unknown) { alert('重做失败: ' + getErrorMessage(error)) }
+  }
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'z') return
+      if ((event.target as HTMLElement)?.closest('input, textarea, select')) return
+      event.preventDefault()
+      if (event.shiftKey) void handleRedo()
+      else void handleUndo()
+    }
+    const onRedo = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'y') return
+      if ((event.target as HTMLElement)?.closest('input, textarea, select')) return
+      event.preventDefault()
+      void handleRedo()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    document.addEventListener('keydown', onRedo)
+    return () => { document.removeEventListener('keydown', onKeyDown); document.removeEventListener('keydown', onRedo) }
+  })
+
+  // 轮询所有运行中的 AI 任务
+  useEffect(() => {
+    if (activeAITasks.length === 0) return
+    const interval = setInterval(async () => {
+      const stillRunning: AITask[] = []
+      const justCompleted: AITask[] = []
+      for (const t of activeAITasks) {
+        try {
+          const latest = await aiApi.getTask(t.id)
+          if (latest.status === 'running' || latest.status === 'pending' || latest.status === 'processing') {
+            stillRunning.push(latest)
+          } else {
+            justCompleted.push(latest)
+          }
+        } catch {
+          // 查询失败，保留任务（下次再试）
+          stillRunning.push(t)
+        }
+      }
+      setActiveAITasks(stillRunning)
+      if (justCompleted.length > 0) {
+        // 保留最近完成的任务几秒用于显示
+        const lastDone = justCompleted[justCompleted.length - 1]
+        setRecentCompleted({ taskId: lastDone.id, meta: taskMeta[lastDone.id], task: lastDone })
+        setTimeout(() => setRecentCompleted(null), 5000)
+        loadPatents()  // AI 任务完成后立即回填刷新
+      }
+    }, 1500)
+    return () => clearInterval(interval)
+  }, [activeAITasks, taskMeta, loadPatents])
+
+  const handleQuickAI = (patentId: number) => {
+    // 打开 AI 快速分析弹窗，让用户配置输入列、提示词、抽取目标
+    setQuickAnalyzePatentIds([patentId])
+    setQuickAnalyzeInputFields([])
+    setShowQuickAnalyze(true)
+  }
+
+  const openSyncUpdate = async (patentIds: number[]) => {
+    if (!activeDatabaseId || patentIds.length === 0) return
+    setSyncUpdatePatentIds(patentIds)
+    setSyncUpdateBatch(null)
+    setSyncUpdateFields({})
+    setSyncUpdateRequestedFields([])
+    setShowSyncUpdate(true)
+    setSyncUpdateLoading(true)
+    try {
+      const result = await syncApi.connectors()
+      const available = result.items.filter(connector => connector.enabled && connector.capabilities.fetch_patent !== false)
+      setSyncUpdateConnectors(available)
+      const connectorId = syncUpdateConnectorId && available.some(item => item.id === syncUpdateConnectorId) ? syncUpdateConnectorId : (available[0]?.id ?? null)
+      setSyncUpdateConnectorId(connectorId)
+      const connector = available.find(item => item.id === connectorId)
+      const supported = connector?.provider_type === 'himmpat_mcp'
+        ? ['publication_number', 'application_number', 'title', 'abstract', 'applicant', 'assignee', 'inventor', 'filing_date', 'publication_date', 'country', 'ipc_all', ...(connector.capabilities.legal_events === true ? ['legal_status', 'grant_date'] : [])]
+        : ['publication_number', 'application_number', 'grant_number', 'title', 'abstract', 'applicant', 'assignee', 'inventor', 'agent', 'filing_date', 'publication_date', 'grant_date', 'country', 'ipc_main', 'ipc_all', 'cpc_main', 'priority_number', 'priority_date', 'legal_status']
+      setSyncUpdateRequestedFields(supported.filter(key => fields.some(field => field.key === key)))
+    } catch (error: unknown) {
+      setShowSyncUpdate(false)
+      alert('加载外部数据连接器失败: ' + getErrorMessage(error))
+    } finally {
+      setSyncUpdateLoading(false)
+    }
+  }
+
+  const previewSyncUpdate = async () => {
+    if (!activeDatabaseId || !syncUpdateConnectorId) return
+    setSyncUpdateLoading(true)
+    try {
+      const result = await syncApi.previewUpdate({
+        connector_id: syncUpdateConnectorId,
+        database_id: activeDatabaseId,
+        patent_ids: syncUpdatePatentIds,
+        fields: syncUpdateRequestedFields,
+      })
+      setSyncUpdateBatch(result)
+      setSyncUpdateFields(Object.fromEntries(result.items.map(item => [item.id, item.selected_fields || []])))
+    } catch (error: unknown) {
+      alert('生成外部更新预览失败: ' + getErrorMessage(error))
+    } finally {
+      setSyncUpdateLoading(false)
+    }
+  }
+
+  const confirmSyncUpdate = async () => {
+    if (!syncUpdateBatch) return
+    const choices = syncUpdateBatch.items
+      .filter(item => ['ready', 'no_change'].includes(item.status))
+      .map(item => ({ item_id: item.id, fields: syncUpdateFields[item.id] || [] }))
+    const count = choices.filter(item => item.fields.length > 0).length
+    if (count === 0) {
+      alert('请至少选择一条有变化的字段')
+      return
+    }
+    if (!window.confirm(`确认覆盖 ${count} 条专利的外部字段吗？确认后将写入主记录，并保留修改历史。`)) return
+    setSyncUpdateLoading(true)
+    try {
+      await syncApi.confirmUpdate(syncUpdateBatch.id, choices)
+      alert(`已覆盖更新 ${count} 条专利`)
+      setShowSyncUpdate(false)
+      setSyncUpdateBatch(null)
+      clearSelection()
+      // Refresh only the currently visible window.  Merging the response into
+      // the existing rows keeps the Excel-like row order, page and scroll
+      // position instead of jumping back to page one after an update.
+      const refreshPage = tableViewMode === 'continuous' ? Math.max(1, continuousPageRef.current) : page
+      const refreshSize = tableViewMode === 'continuous'
+        ? Math.min(Math.max(pageSize, patentsRef.current.length), 1000)
+        : pageSize
+      await loadPatents(refreshPage, false, refreshSize, true)
+    } catch (error: unknown) {
+      alert('确认外部更新失败: ' + getErrorMessage(error))
+    } finally {
+      setSyncUpdateLoading(false)
+    }
+  }
+
+  const cancelSyncUpdate = async () => {
+    if (syncUpdateBatch) {
+      try { await syncApi.cancelUpdate(syncUpdateBatch.id) } catch { /* preview may already be expired */ }
+    }
+    setShowSyncUpdate(false)
+    setSyncUpdateBatch(null)
+  }
+
+  const toggleSyncUpdateField = (itemId: number, fieldKey: string) => {
+    setSyncUpdateFields(previous => {
+      const current = previous[itemId] || []
+      return { ...previous, [itemId]: current.includes(fieldKey) ? current.filter(key => key !== fieldKey) : [...current, fieldKey] }
+    })
+  }
+
+  const toggleSyncUpdateRequestedField = (fieldKey: string) => {
+    setSyncUpdateRequestedFields(previous => previous.includes(fieldKey) ? previous.filter(key => key !== fieldKey) : [...previous, fieldKey])
+  }
+
+  const handleCellQuickAI = (patentId: number, fieldKey: string) => {
+    // Capture both the record and source column at invocation time. Later
+    // selection changes in the table must not change an already opened task.
+    setQuickAnalyzePatentIds([patentId])
+    setQuickAnalyzeInputFields([fieldKey])
+    setShowQuickAnalyze(true)
+    setContextMenu(null)
+  }
+
+  const handleQuickAnalyzeStarted = (task: AITask) => {
+    setShowQuickAnalyze(false)
+    setActiveAITasks(prev => [...prev, task])
+    setTaskMeta(prev => ({
+      ...prev,
+      [task.id]: {
+        fieldName: 'AI 快速分析',
+        fieldKey: 'quick_analyze',
+        prompt: '按本次快速分析弹窗中的模板、输入列和抽取目标执行',
+        referencedColumns: quickAnalyzeInputFields.map(key => fields.find(field => field.key === key)?.name || key),
+        outputLocation: '按本次抽取目标回填字段',
+        targetCount: task.total_items,
+      },
+    }))
+    setAiPanelOpen(true)
+    // 若是单行触发，设置行 loading
+    if (quickAnalyzePatentIds.length === 1) {
+      setAiProcessingRow(quickAnalyzePatentIds[0])
+    }
+  }
+
+  // 当没有运行中的任务时，清除行 loading
+  useEffect(() => {
+    if (activeAITasks.length === 0 && aiProcessingRow !== null) {
+      // The task monitor is the external source of truth for this loading state.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setAiProcessingRow(null)
+    }
+  }, [activeAITasks.length, aiProcessingRow])
+
+  const handleInsertAIColumn = async () => {
+    if (!newAIColumnName.trim()) {
+      alert('请输入新列名称')
+      return
+    }
+    if ((insertColType === 'select') && !newColumnOptions.trim()) {
+      alert('单选列必须填写候选项（每行一个）')
+      return
+    }
+    setCreatingAIColumn(true)
+    try {
+      const key = 'cf_' + Date.now().toString(36)
+      const payload: Partial<CustomField> = {
+        key,
+        name: newAIColumnName.trim(),
+        field_type: insertColType,
+        is_active: true,
+        sort_order: fields.length,
+      }
+      if (insertColType === 'select' && newColumnOptions.trim()) {
+        payload.options = newColumnOptions.split('\n').map(s => s.trim()).filter(Boolean)
+      }
+      const createdField = await customFieldApi.create(payload)
+      const createdKey = createdField.key || key
+      const insertIntoKeys = (currentKeys: string[]) => {
+        const next = currentKeys.filter(item => item !== createdKey)
+        const anchorIndex = insertAnchorFieldKey ? next.indexOf(insertAnchorFieldKey) : -1
+        const index = anchorIndex < 0 ? next.length : anchorIndex + (insertSide === 'after' ? 1 : 0)
+        next.splice(index, 0, createdKey)
+        return next
+      }
+
+      if (activeView) {
+        const currentConfig = buildViewColumnConfig(activeView, fields)
+        const currentKeys = currentConfig.map(column => column.key)
+        const nextKeys = insertIntoKeys(currentKeys)
+        const columnByKey = new Map(currentConfig.map(column => [column.key, column]))
+        const nextConfig = nextKeys.map((fieldKey, order) => ({
+          ...(columnByKey.get(fieldKey) || { key: fieldKey, visible: true, width: DEFAULT_COLUMN_WIDTH }),
+          order,
+        }))
+        await saveViewColumnConfig(nextConfig)
+      }
+      // 记录冻结状态
+      if (insertColFrozen) {
+        setFrozenFields(prev => new Set(prev).add(createdKey))
+      }
+      await loadFields()
+      await loadCustomFields()
+      if (!activeView) {
+        setFields(current => {
+          const nextKeys = insertIntoKeys(current.map(field => field.key))
+          const orderMap = new Map(nextKeys.map((fieldKey, index) => [fieldKey, index]))
+          try { localStorage.setItem('patwiki_field_order', JSON.stringify(nextKeys)) } catch { /* storage is optional */ }
+          return [...current].sort((a, b) => (orderMap.get(a.key) ?? Number.MAX_SAFE_INTEGER) - (orderMap.get(b.key) ?? Number.MAX_SAFE_INTEGER))
+        })
+      }
+      alert(`新列"${newAIColumnName.trim()}"已创建`)
+      setShowInsertAIColumn(false)
+      setNewAIColumnName('')
+      setNewColumnOptions('')
+      setInsertColType('text')
+      setInsertColFrozen(false)
+      loadPatents()
+    } catch (error: unknown) {
+      alert('创建列失败: ' + getErrorMessage(error))
+    } finally {
+      setCreatingAIColumn(false)
+    }
+  }
+
+  const openInsertAIDialog = (
+    mode: typeof insertColType = 'text',
+    anchorFieldKey: string | null = null,
+    side: 'before' | 'after' = 'after',
+  ) => {
+    setActiveHeaderMenu(null)
+    setContextMenu(null)
+    setInsertColType(mode)
+    setInsertAnchorFieldKey(anchorFieldKey)
+    setInsertSide(side)
+    setNewAIColumnName('')
+    setNewColumnOptions('')
+    setShowInsertAIColumn(true)
+  }
+
+  const handleReorderFields = (keys: string[]) => {
+    const orderMap = new Map(keys.map((key, index) => [key, index]))
+    setFields(current => [...current].sort((a, b) => (orderMap.get(a.key) ?? Number.MAX_SAFE_INTEGER) - (orderMap.get(b.key) ?? Number.MAX_SAFE_INTEGER)))
+    try { localStorage.setItem('patwiki_field_order', JSON.stringify(keys)) } catch { /* storage is optional */ }
+  }
+
+  const handleToggleFreeze = (fieldKey: string) => {
+    setActiveHeaderMenu(null)
+    setFrozenFields(prev => {
+      const next = new Set(prev)
+      if (next.has(fieldKey)) {
+        next.delete(fieldKey)
+      } else {
+        next.add(fieldKey)
+      }
+      try {
+        localStorage.setItem('patwiki_frozen_fields', JSON.stringify([...next]))
+      } catch (error) { console.error('Failed to save frozen fields:', error) }
+      return next
+    })
+  }
+
+  const openColumnStats = async (fieldKey: string) => {
+    setActiveHeaderMenu(null)
+    setStatsFieldKey(fieldKey)
+    setShowColumnStats(true)
+    setStatsLoading(true)
+    setStatsData([])
+    try {
+      const result = await analyticsApi.columnStats({
+        field_key: fieldKey,
+        database_id: isGlobalMasterTable ? undefined : activeDatabaseId ?? undefined,
+        product_id: currentProductId || undefined,
+      })
+      setStatsData(result.items)
+    } catch (error: unknown) {
+      alert('统计失败: ' + getErrorMessage(error))
+    } finally {
+      setStatsLoading(false)
+    }
+  }
+
+  const handleStatsToTags = async () => {
+    if (!statsFieldKey) return
+    setConvertingTags(true)
+    try {
+      const result = await analyticsApi.statsToTags({
+        field_key: statsFieldKey,
+        group_name: tagGroupName.trim() || '自动分类',
+        auto_apply_to_patents: autoApplyTags,
+        database_id: isGlobalMasterTable ? undefined : activeDatabaseId ?? undefined,
+        product_id: currentProductId || undefined,
+      })
+      alert(`已创建标签组"${result.group.name}"，共 ${result.total_tags} 个标签${autoApplyTags ? `，已为 ${result.applied_count} 条专利打标` : ''}`)
+      setShowStatsToTags(false)
+      setShowColumnStats(false)
+    } catch (error: unknown) {
+      alert('转换失败: ' + getErrorMessage(error))
+    } finally {
+      setConvertingTags(false)
+    }
+  }
+
+  // 从当前表格移除列。列移除只改变视图/浏览器列配置，不删除专利主数据。
+  const deleteColumnByKey = async (fieldKey: string) => {
+    const field = fields.find(f => f.key === fieldKey)
+    if (!field) {
+      alert('未找到该列信息')
+      return
+    }
+    try {
+      if (activeView) {
+        const beforeConfig = buildViewColumnConfig(activeView, fields)
+        const next = beforeConfig.map(column =>
+          column.key === fieldKey ? { ...column, visible: false } : column,
+        )
+        await saveViewColumnConfig(next)
+        setColumnUndo({ viewId: activeView.id, beforeConfig, afterConfig: next, beforeFields: fields, afterFields: fields })
+      } else {
+        const beforeFields = fields
+        const afterFields = fields.map(item => item.key === fieldKey ? { ...item, visible: false } : item)
+        setFields(previous => {
+          const next = previous.map(item => item.key === fieldKey ? { ...item, visible: false } : item)
+          try {
+            localStorage.setItem('patwiki_hidden_fields', JSON.stringify(next.filter(item => item.visible === false).map(item => item.key)))
+          } catch (error) { console.error('Failed to save hidden fields:', error) }
+          return next
+        })
+        setColumnUndo({ viewId: null, beforeConfig: null, afterConfig: null, beforeFields, afterFields })
+      }
+      setColumnRedo(null)
+      setContextMenu(null)
+    } catch (error: unknown) {
+      alert('移除列失败: ' + getErrorMessage(error))
+    }
+  }
+
+  // 删除单行专利
+  const handleDeletePatent = async (patentId: number) => {
+    const patent = patents.find(p => p.id === patentId)
+    if (!patent) return
+    const title = patent.title || `#${patentId}`
+    const confirmText = `确定要删除专利"${title}"吗？\n\n• 申请号：${patent.application_number || '无'}\n• 公开号：${patent.publication_number || '无'}\n• 此操作不可撤销，删除后数据无法恢复`
+    if (!confirm(confirmText)) return
+    // 二次确认（防误删）
+    if (!confirm('再次确认删除？此操作不可撤销！')) return
+    try {
+      await patentApi.delete(patentId)
+      // 从已选中移除
+      if (selectedIds.includes(patentId)) {
+        setSelectedIds(selectedIds.filter(id => id !== patentId))
+      }
+      await refreshAfterDeletion([patentId])
+    } catch (error: unknown) {
+      alert('删除失败: ' + getErrorMessage(error))
+    }
+  }
+
+  // 右键菜单触发（行/列）
+  const handleContextMenu = (e: React.MouseEvent, type: 'row' | 'header', data: { patentId?: number; fieldKey?: string }) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (type === 'header' && data.fieldKey && patents[0]) {
+      setActiveCell({ patentId: patents[0].id, fieldKey: data.fieldKey })
+    }
+    if (type === 'header' && data.fieldKey) {
+      // 列选中 = 选中当前库该列的全部数据，让列菜单的批量操作作用于整列而不是当前页。
+      void selectAllInScope()
+    }
+    setContextMenu({
+      x: e.clientX,
+      y: e.clientY,
+      type,
+      patentId: data.patentId,
+      fieldKey: data.fieldKey,
+    })
+  }
+
+  const handleAddToView = async () => {
+    if (!addToViewId || selectedIds.length === 0) return
+    try {
+      const result = await viewApi.addPatents(addToViewId, selectedIds)
+      setShowAddToView(false)
+      alert(`已将 ${result.updated_count} 条专利加入业务视图`)
+      clearSelection()
+    } catch (error: unknown) {
+      alert(`加入业务视图失败：${getErrorMessage(error)}`)
+    }
+  }
+
+  const fetchScopePage = useCallback(async (requestedPage: number, requestedPageSize: number) => {
+    if (searchText && searchMode !== 'keyword') {
+      return { items: requestedPage === 1 ? patents : [], total: patents.length }
+    }
+    const extraFilters: JsonObject = {}
+    Object.entries(filterValues).forEach(([key, condition]) => {
+      if (filterConditionHasValue(condition)) extraFilters[key] = condition as unknown as JsonValue
+    })
+    const activeViewForQuery = viewId === null
+      ? undefined
+      : viewsRef.current.find(view => view.id === viewId && view.database_id === activeDatabaseId)
+    if (activeViewForQuery) {
+      const params = {
+        page: requestedPage,
+        page_size: requestedPageSize,
+        search: searchText || undefined,
+        sort_by: sortField,
+        sort_order: sortOrder,
+        group_by_family: groupByFamily,
+        extra_filters: extraFilters,
+      }
+      if (getViewGroupFields(activeViewForQuery).length > 0 && !groupByFamily) {
+        const result = await viewApi.grouped(activeViewForQuery.id, params)
+        return { items: flattenGroups(result.groups), total: result.total }
+      }
+      const result = await viewApi.listPatents(activeViewForQuery.id, params)
+      return { items: result.items as Patent[], total: result.total }
+    }
+    const params: JsonObject = {
+      page: requestedPage,
+      page_size: requestedPageSize,
+      sort_by: sortField,
+      sort_order: sortOrder,
+    }
+    if (searchText) params.search = searchText
+    if (!isGlobalMasterTable && activeDatabaseId != null) params.database_id = activeDatabaseId
+    if (currentProductId) params.product_id = currentProductId
+    if (groupByFamily) params.group_by_family = true
+    if (Object.keys(extraFilters).length) params.filters = JSON.stringify(extraFilters)
+    const result = await patentApi.list(params)
+    return { items: result.items, total: result.total }
+  }, [activeDatabaseId, currentProductId, filterValues, groupByFamily, isGlobalMasterTable, patents, searchMode, searchText, sortField, sortOrder, viewId])
+
+  // 读取“当前库（含当前筛选/视图）”的全部专利 ID，用于“勾选当前库全部”和列选中的整列操作。
+  const fetchAllScopeIds = useCallback(async () => {
+    if (searchText && searchMode !== 'keyword') return patentsRef.current.map(item => item.id)
+    const firstPage = await fetchScopePage(1, 1000)
+    const ids = firstPage.items.map(item => item.id)
+    const total = firstPage.total
+    for (let pageNumber = 2; ids.length < total; pageNumber += 1) {
+      const next = await fetchScopePage(pageNumber, 1000)
+      if (next.items.length === 0) break
+      ids.push(...next.items.map(item => item.id))
+    }
+    return ids
+  }, [fetchScopePage, searchMode, searchText])
+
+  const selectCurrentPage = () => setSelectedIds(patentsRef.current.map(item => item.id))
+
+  const selectAllInScope = async () => {
+    if (scopeSelecting) return
+    setScopeSelecting(true)
+    try {
+      const ids = await fetchAllScopeIds()
+      setSelectedIds(ids)
+    } catch (error: unknown) {
+      alert('勾选当前库全部失败: ' + getErrorMessage(error))
+    } finally {
+      setScopeSelecting(false)
+    }
+  }
+
+  const writeClipboardText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      const copied = document.execCommand('copy')
+      textarea.remove()
+      if (!copied) throw new Error('clipboard unavailable')
+    }
+  }
+
+  const columnValueText = (patent: Patent, fieldKey: string) => {
+    const value = getFieldValue(patent, fieldKey)
+    if (value == null) return ''
+    if (fieldKey === 'original_links' && Array.isArray(value)) {
+      return value.flatMap(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+        const urls = (item as JsonObject).urls
+        return Array.isArray(urls) ? urls.filter((url): url is string => typeof url === 'string') : []
+      }).join(' | ')
+    }
+    if (typeof value === 'object') return JSON.stringify(value)
+    return String(value)
+  }
+
+  const toTsvCell = (value: string) => /[\t\r\n"]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
+
+  const handleCopyColumn = async (fieldKey: string) => {
+    try {
+      const firstPage = await fetchScopePage(1, 1000)
+      const rows = [...firstPage.items]
+      const total = firstPage.total
+      for (let pageNumber = 2; rows.length < total; pageNumber += 1) {
+        const next = await fetchScopePage(pageNumber, 1000)
+        if (next.items.length === 0) break
+        rows.push(...next.items)
+      }
+      await writeClipboardText(rows.map(patent => toTsvCell(columnValueText(patent, fieldKey))).join('\r\n'))
+      setContextMenu(null)
+    } catch {
+      alert('复制整列失败，请确认浏览器允许访问剪贴板后重试')
+    }
+  }
+
+  const handleQuickSelectRange = async () => {
+    const intervals: Array<[number, number]> = []
+    for (const segment of quickSelectRange.split(',')) {
+      const match = segment.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/)
+      if (!match) {
+        alert('请输入序号或范围，例如 1-10,15,20-25')
+        return
+      }
+      const start = Number(match[1])
+      const end = Number(match[2] || match[1])
+      if (start < 1 || end < start) {
+        alert('序号范围无效，请使用从小到大的正整数')
+        return
+      }
+      intervals.push([start, end])
+    }
+    if (intervals.length === 0) return
+
+    setQuickSelectLoading(true)
+    try {
+      const isSemanticResult = !!searchText && searchMode !== 'keyword'
+      const total = isSemanticResult ? patents.length : (await fetchScopePage(1, 1)).total
+      if (intervals.some(([, end]) => end > total)) {
+        alert(`当前筛选结果共 ${total} 条，范围不能超过 ${total}`)
+        return
+      }
+      const pageSizeForRange = 1000
+      const pages = new Set<number>()
+      intervals.forEach(([start, end]) => {
+        for (let pageNumber = Math.ceil(start / pageSizeForRange); pageNumber <= Math.ceil(end / pageSizeForRange); pageNumber += 1) {
+          pages.add(pageNumber)
+        }
+      })
+      const selected = new Set(selectedIds)
+      for (const pageNumber of [...pages].sort((a, b) => a - b)) {
+        const result = isSemanticResult
+          ? { items: patents, total: patents.length }
+          : await fetchScopePage(pageNumber, pageSizeForRange)
+        result.items.forEach((patent, index) => {
+          const sequence = (pageNumber - 1) * pageSizeForRange + index + 1
+          if (intervals.some(([start, end]) => sequence >= start && sequence <= end)) selected.add(patent.id)
+        })
+      }
+      setSelectedIds([...selected])
+      setShowQuickSelect(false)
+    } catch (error: unknown) {
+      alert('按范围勾选失败: ' + getErrorMessage(error))
+    } finally {
+      setQuickSelectLoading(false)
+    }
+  }
+
+  // 复制单元格值到剪贴板
+  const handleCopyCell = (patentId: number, fieldKey: string) => {
+    const patent = patents.find(p => p.id === patentId)
+    if (!patent) return
+    const value = getFieldValue(patent, fieldKey)
+    const text = value === null || value === undefined ? '' : String(value)
+    navigator.clipboard?.writeText(text).then(
+      () => { /* 复制成功，不弹窗 */ },
+      () => { alert('复制失败：' + text) }
+    )
+  }
+
+  const handleBulkEditSave = async () => {
+    const updates: Partial<Patent> = {}
+    if (bulkModule) updates.module = bulkModule
+    if (bulkRiskLevel) {
+      updates.risk_level = bulkRiskLevel
+      if (bulkRiskLevel !== 'none') updates.has_risk = true
+      else updates.has_risk = false
+    }
+    if (bulkCategory) updates.category = bulkCategory
+    if (bulkLegalStatus) updates.legal_status = bulkLegalStatus
+    if (bulkCountry) updates.country = bulkCountry
+    if (bulkApplicant) updates.applicant = bulkApplicant
+    if (bulkFieldKey) {
+      const field = fields.find(item => item.key === bulkFieldKey)
+      if (!field) {
+        alert('请选择有效字段')
+        return
+      }
+      const typedValue: JsonValue = field.field_type === 'boolean'
+        ? bulkFieldValue === 'true'
+        : bulkFieldValue
+      if (field.is_system) {
+        ;(updates as Record<string, JsonValue>)[field.key] = typedValue
+      } else {
+        updates.custom_fields = { [field.key]: typedValue }
+      }
+    }
+    if (Object.keys(updates).length === 0) {
+      alert('请至少填写一个要修改的字段')
+      return
+    }
+    try {
+      await patentApi.bulkUpdate(selectedIds, updates)
+      alert(`成功更新 ${selectedIds.length} 条专利`)
+      setShowBulkEdit(false)
+      setBulkModule('')
+      setBulkRiskLevel('')
+      setBulkCategory('')
+      setBulkLegalStatus('')
+      setBulkCountry('')
+      setBulkApplicant('')
+      setBulkFieldKey('')
+      setBulkFieldValue('')
+      clearSelection()
+      loadPatents()
+    } catch (error: unknown) {
+      alert('批量更新失败: ' + getErrorMessage(error))
+    }
+  }
+
+  const handleBulkTagSave = async () => {
+    let tagIds = bulkTagIds
+    if (bulkCategoryTag) {
+      const existing = tagsList.find(tag => tag.name === bulkCategoryTag)
+      const categoryTag = existing || await tagManagementApi.create({ name: bulkCategoryTag, color: '#0f766e' })
+      if (!existing) setTagsList(current => [...current, categoryTag])
+      tagIds = [...new Set([...tagIds, categoryTag.id])]
+    }
+    if (tagIds.length === 0) {
+      alert('请至少选择一个标签')
+      return
+    }
+    try {
+      const result = await patentApi.bulkTag(selectedIds, tagIds, bulkTagMode)
+      const actionText = bulkTagMode === 'add' ? '添加' : bulkTagMode === 'remove' ? '移除' : '替换'
+      alert(`已为 ${result.updated_count} 条专利${actionText}标签`)
+      setShowBulkTag(false)
+      setBulkTagIds([])
+      setBulkTagMode('add')
+      setBulkCategoryTag('')
+      clearSelection()
+      loadPatents()
+    } catch (error: unknown) {
+      alert('批量打标签失败: ' + getErrorMessage(error))
+    }
+  }
+
+  const handleBulkRollbackBefore = async () => {
+    const input = window.prompt('请输入回滚时间（例如 2026-01-01T12:00）')
+    if (!input || !selectedIds.length) return
+    const before = new Date(input)
+    if (Number.isNaN(before.getTime())) {
+      alert('时间格式无效')
+      return
+    }
+    if (!window.confirm(`确认将选中的 ${selectedIds.length} 条专利恢复到 ${input} 之前吗？`)) return
+    try {
+      const result = await patentApi.rollbackBefore(selectedIds, before.toISOString())
+      alert(`已恢复 ${result.restored_count} 个字段`)
+      clearSelection()
+      await loadPatents()
+    } catch (error: unknown) {
+      alert('批量回滚失败: ' + getErrorMessage(error))
+    }
+  }
+
+  const requestDeleteColumnByKey = (fieldKey: string) => setPendingColumnDelete(fieldKey)
+
+  const toggleBulkTagId = (tagId: number) => {
+    setBulkTagIds(prev => prev.includes(tagId) ? prev.filter(id => id !== tagId) : [...prev, tagId])
+  }
+
+  const handlePageJump = () => {
+    const p = parseInt(pageInputValue)
+    if (!isNaN(p) && p >= 1 && p <= totalPages) {
+      setPage(p)
+    } else {
+      setPageInputValue(String(page))
+    }
+  }
+
+  const getFieldValue = (patent: Patent, fieldKey: string): JsonValue => {
+    const field = fields.find(f => f.key === fieldKey)
+    if (!field) return null
+    // 关系原始列是系统注册字段，但实际值保存在 custom_fields，
+    // 以保留来源单元格而不把关系实体 ID 写进 Patent 主表。
+    if (['family_members', 'cited_patents', 'citing_patents'].includes(fieldKey)) {
+      return patent.custom_fields?.[fieldKey] ?? null
+    }
+    if (field.is_system) {
+      return (patent as unknown as Record<string, JsonValue>)[fieldKey] ?? null
+    }
+    return patent.custom_fields?.[fieldKey] ?? patent.ai_fields?.[fieldKey] ?? null
+  }
+
+  const formatValue = (value: JsonValue, field: FieldMeta): string => {
+    if (value === null || value === undefined || value === '') return '-'
+    if (field.field_type === 'date' && value) {
+      return formatApiDate(String(value))
+    }
+    if (field.field_type === 'boolean') {
+      return value ? '是' : '否'
+    }
+    if (Array.isArray(value)) {
+      return value.join(', ')
+    }
+    return String(value)
+  }
+
+  const getStatusText = (status?: string) => {
+    const map: Record<string, string> = {
+      granted: '授权', examining: '实审中', published: '公开',
+      rejected: '驳回', withdrawn: '撤回', deemed_withdrawn: '视撤',
+      expired: '终止', abandoned: '放弃', pending: '待审', unknown: '未知',
+    }
+    return map[status || 'unknown'] || status || '未知'
+  }
+
+  const getRiskText = (level?: string, hasRisk?: boolean) => {
+    if (!hasRisk) return '-'
+    const map: Record<string, string> = {
+      critical: '严重', high: '高', medium: '中', low: '低', none: '无',
+    }
+    return map[level || 'none'] || '-'
+  }
+
+  const groupPresentation = groupedGroups.length > 0
+    ? getGroupPresentation(groupedGroups, collapsedGroupKeys)
+    : null
+  const displayPatents = groupPresentation
+    ? patents.filter(patent => groupPresentation.visibleIds.has(patent.id) || groupPresentation.headerIds.has(patent.id))
+    : patents
+  const familyFirstIds = new Set<number>()
+  if (groupByFamily) {
+    let previousFamilyKey: string | null = null
+    displayPatents.forEach(patent => {
+      const familyKey = patent.family_id ? `family:${patent.family_id}` : null
+      if (familyKey && familyKey !== previousFamilyKey) familyFirstIds.add(patent.id)
+      previousFamilyKey = familyKey
+    })
+  }
+  const familyDisplayPatents = displayPatents
+  const saveGroupConfig = async (fields: ViewGroupField[]) => {
+    if (!activeView) return
+    const result = await viewApi.updateGroupConfig(activeView.id, { fields })
+    setViews(views.map(view => view.id === activeView.id
+      ? { ...view, group_by_config: result.group_by_config }
+      : view))
+    setPage(1)
+  }
+
+  const saveConditionalFormatting = async (rules: ConditionalFormatRule[]) => {
+    if (!activeView) return
+    const result = await viewApi.updateConditionalFormatting(activeView.id, rules)
+    setViews(views.map(view => view.id === activeView.id
+      ? { ...view, conditional_formatting: result.conditional_formatting }
+      : view))
+  }
+
+  const handleViewChange = (updatedView: PatentView) => {
+    setViews(views.map(view => view.id === updatedView.id ? updatedView : view))
+  }
+
+  const handleKanbanTotalChange = useCallback((total: number) => {
+    setPatents([], total)
+  }, [setPatents])
+
+  const getConditionalCellStyle = (fieldKey: string, value: JsonValue): React.CSSProperties => {
+    const rule = activeView?.conditional_formatting?.find(item => item.field === fieldKey)
+    const condition = rule?.conditions?.find(item => {
+      const empty = value === null || value === undefined || value === ''
+      if (item.op === 'is_empty') return empty
+      if (item.op === 'is_not_empty') return !empty
+      if (empty) return false
+      const expected = item.value
+      if (item.op === 'contains') return String(value).toLowerCase().includes(String(expected).toLowerCase())
+      if (item.op === 'starts_with') return String(value).toLowerCase().startsWith(String(expected).toLowerCase())
+      if (item.op === 'ends_with') return String(value).toLowerCase().endsWith(String(expected).toLowerCase())
+      if (['>', '<', '>=', '<='].includes(item.op)) {
+        const left = Number(value)
+        const right = Number(expected)
+        if (Number.isNaN(left) || Number.isNaN(right)) return false
+        return item.op === '>' ? left > right : item.op === '<' ? left < right : item.op === '>=' ? left >= right : left <= right
+      }
+      if (item.op === 'date_within') {
+        const actual = parseApiDate(String(value))?.getTime() ?? Number.NaN
+        const days = Number(expected)
+        const multiplier = item.unit === 'week' ? 7 : item.unit === 'month' ? 30 : 1
+        return !Number.isNaN(actual) && !Number.isNaN(days) && actual >= Date.now() && actual <= Date.now() + days * multiplier * 86400000
+      }
+      if (item.op === 'date_before' || item.op === 'date_after') {
+        const actual = parseApiDate(String(value))?.getTime() ?? Number.NaN
+        const target = parseApiDate(String(expected))?.getTime() ?? Number.NaN
+        return item.op === 'date_before' ? actual < target : actual > target
+      }
+      return item.op === '!=' ? String(value).toLowerCase() !== String(expected).toLowerCase() : String(value).toLowerCase() === String(expected).toLowerCase()
+    })
+    const style = condition?.style
+    if (!style) return {}
+    return {
+      backgroundColor: style.bgColor,
+      color: style.color,
+      fontWeight: style.fontWeight,
+      fontStyle: style.fontStyle,
+      textDecoration: style.textDecoration,
+      opacity: style.opacity,
+    }
+  }
+  const visibleFields = (() => {
+    const baseFields = activeView?.column_config?.length ? fields : fields.filter(f => f.visible !== false)
+    const columnConfig = activeView?.column_config || []
+    if (columnConfig.length === 0) return baseFields
+
+    const configByKey = new Map(columnConfig.map(column => [column.key, column]))
+    return baseFields
+      // Explicit view configuration is authoritative. Newly imported fields are
+      // available in column management but do not silently enter this work table.
+      .filter(field => {
+        const configuredColumn = configByKey.get(field.key)
+        return configuredColumn?.visible === true || (
+          configuredColumn === undefined
+          && ['family_members', 'cited_patents', 'citing_patents', 'original_links'].includes(field.key)
+          && field.visible !== false
+        )
+      })
+      .sort((a, b) => {
+        const aOrder = configByKey.get(a.key)?.order ?? Number.MAX_SAFE_INTEGER
+        const bOrder = configByKey.get(b.key)?.order ?? Number.MAX_SAFE_INTEGER
+        return aOrder - bOrder
+      })
+  })()
+  const detailVisibleFields = configuredDetailKeys
+    ? configuredDetailKeys.map(key => fields.find(field => field.key === key)).filter((field): field is FieldMeta => Boolean(field))
+    : fields.filter(field => DEFAULT_DETAIL_FIELD_KEYS.includes(field.key)).length > 0
+      ? fields.filter(field => DEFAULT_DETAIL_FIELD_KEYS.includes(field.key))
+      : visibleFields.slice(0, 7)
+  const totalPages = Math.ceil(totalPatents / pageSize)
+  // 表头复选框反映“当前页是否已全选”，整库全选时仍可能包含未加载的页。
+  const allSelected = patents.length > 0 && patents.every(patent => selectedIds.includes(patent.id))
+  const someSelected = patents.some(patent => selectedIds.includes(patent.id))
+  const allLibrarySelected = totalPatents > 0 && selectedIds.length >= totalPatents
+  const hasActiveFilters = Object.values(filterValues).some(filterConditionHasValue) || !!searchText
+
+  useEffect(() => {
+    // Put the cursor on the first usable cell after the first data load. Keep
+    // a user's current position when more continuous-scroll rows arrive or a
+    // detail page returns to the same filtered scope.
+    if (activeCell && patents.some(patent => patent.id === activeCell.patentId) && visibleFields.some(field => field.key === activeCell.fieldKey)) {
+      return
+    }
+    if (patents.length > 0 && visibleFields.length > 0) {
+      // This synchronizes the keyboard/mouse cursor with the first external
+      // data load; later row loads preserve the user's selected cell.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setActiveCell({ patentId: patents[0].id, fieldKey: visibleFields[0].key })
+    } else if (patents.length === 0 || visibleFields.length === 0) {
+      setActiveCell(null)
+    }
+  }, [activeCell, patents, visibleFields])
+
+  const pageNumbers = () => {
+    const pages: (number | string)[] = []
+    const maxVisible = 5
+    if (totalPages <= maxVisible + 2) {
+      for (let i = 1; i <= totalPages; i++) pages.push(i)
+    } else {
+      pages.push(1)
+      const start = Math.max(2, page - 2)
+      const end = Math.min(totalPages - 1, page + 2)
+      if (start > 2) pages.push('...')
+      for (let i = start; i <= end; i++) pages.push(i)
+      if (end < totalPages - 1) pages.push('...')
+      pages.push(totalPages)
+    }
+    return pages
+  }
+
+  const renderCellEditor = (patent: Patent, field: FieldMeta, value: JsonValue) => {
+    const cancel = () => setEditingCell(null)
+
+    if (field.field_type === 'link') {
+      return (
+        <LinkFieldEditor
+          patentId={patent.id}
+          field={field}
+          currentLinks={relationData[field.key]?.[patent.id]?.links || []}
+          onChanged={() => void loadRelationData()}
+          onCancel={cancel}
+        />
+      )
+    }
+
+    return <CellEditor field={field} value={value} onSave={v => void handleCellSave(patent.id, field.key, v)} onCancel={cancel} />
+  }
+
+  const renderCellContent = (patent: Patent, field: FieldMeta) => {
+    const value = getFieldValue(patent, field.key)
+    const isEditing = editingCell?.patentId === patent.id && editingCell?.fieldKey === field.key
+
+    if (isEditing) {
+      return renderCellEditor(patent, field, value)
+    }
+
+    if (field.key === 'original_links' && Array.isArray(value)) {
+      const entries = value.filter(item => !!item && typeof item === 'object' && !Array.isArray(item)) as unknown as JsonObject[]
+      return entries.length ? (
+        <div style={{ display: 'grid', gap: 5 }}>
+          {entries.map((entry, index) => {
+            const identifierType = entry.identifier_type === 'grant' ? '授权号' : '公开号'
+            const identifierValue = String(entry.identifier_value || '')
+            const urls = Array.isArray(entry.urls) ? entry.urls.filter((url): url is string => typeof url === 'string') : []
+            return <div key={`${identifierType}-${identifierValue}-${index}`}>
+              <div style={{ color: '#64748b', fontSize: 11 }}>{identifierType} {identifierValue}</div>
+              {urls.map((rawUrl, urlIndex) => {
+                const url = safeHttpUrl(rawUrl)
+                return url ? <a key={`${url}-${urlIndex}`} href={url} target="_blank" rel="noreferrer noopener" onClick={event => event.stopPropagation()} style={{ color: '#2563eb', display: 'block', overflowWrap: 'anywhere' }}>{url}</a> : null
+              })}
+            </div>
+          })}
+        </div>
+      ) : <span style={{ color: '#94a3b8' }}>-</span>
+    }
+
+    if (field.field_type === 'attachment') {
+      const attachmentDatabaseId = isGlobalMasterTable && activeDatabaseId !== null
+        ? (patent.database_ids?.includes(activeDatabaseId)
+          ? activeDatabaseId
+          : patent.database_ids?.[0] ?? patent.database_id ?? activeDatabaseId)
+        : activeDatabaseId
+      return <AttachmentField
+        patentId={patent.id}
+        databaseId={attachmentDatabaseId}
+        fieldKey={field.key}
+        value={value}
+        displayMode="thumbnail"
+        onChange={attachments => updatePatentAttachments(patent.id, field.key, attachments)}
+      />
+    }
+
+    if (field.field_type === 'url') {
+      const url = safeHttpUrl(String(value ?? '').trim())
+      if (!url) return <span style={{ color: '#94a3b8', fontSize: 12 }}>{value ? String(value) : '-'}</span>
+      if (isImageUrl(url)) {
+        return (
+          <button
+            type="button"
+            onClick={event => { event.stopPropagation(); setUrlImagePreview({ src: url, title: url }) }}
+            title={url}
+            style={{ display: 'block', padding: 0, border: 'none', background: 'transparent', cursor: 'zoom-in' }}
+          >
+            <img
+              src={url}
+              alt={field.name}
+              loading="lazy"
+              style={{ display: 'block', width: 64, height: 48, objectFit: 'contain', border: '1px solid #e2e8f0', borderRadius: 4, background: '#f8fafc' }}
+            />
+          </button>
+        )
+      }
+      return (
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer noopener"
+          onClick={event => event.stopPropagation()}
+          style={{ color: '#2563eb', display: 'block', whiteSpace: 'normal', wordBreak: 'break-all', lineHeight: 1.5 }}
+        >
+          {url}
+        </a>
+      )
+    }
+
+    if (field.field_type === 'link') {
+      const links = relationData[field.key]?.[patent.id]?.links || []
+      return links.length > 0 ? (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+          {links.map(link => (
+            <span key={link.id} style={{ display: 'inline-block', padding: '2px 6px', borderRadius: 4, background: '#eff6ff', color: '#1d4ed8', fontSize: 12 }}>
+              <PatentReferenceText value={link.label} onOpen={(number) => void handlePatentReferenceClick(number)} />
+            </span>
+          ))}
+        </div>
+      ) : <span style={{ color: '#94a3b8', fontSize: 12 }}>-</span>
+    }
+
+    if (field.field_type === 'lookup' || field.field_type === 'rollup') {
+      const relationValue = relationData[field.key]?.[patent.id]?.value
+      const displayValue = formatValue(relationValue ?? null, field)
+      return (
+        <span style={{ color: displayValue === '-' ? '#94a3b8' : '#374151', display: 'block', whiteSpace: 'normal', wordBreak: 'break-word', overflowWrap: 'anywhere', lineHeight: 1.5 }}>
+          <PatentReferenceText value={displayValue} onOpen={(number) => void handlePatentReferenceClick(number)} />
+        </span>
+      )
+    }
+
+    if (field.key === 'product_id') {
+      const product = products.find(item => item.id === patent.product_id)
+      return <span style={{ color: product ? '#334155' : '#94a3b8' }}><PatentReferenceText value={product?.name || (patent.product_id ? `产品 #${patent.product_id}` : '-')} onOpen={(number) => void handlePatentReferenceClick(number)} /></span>
+    }
+
+    if (field.key === 'projects') {
+      const linkedProjects = patent.projects || []
+      return linkedProjects.length > 0
+        ? <span style={{ color: '#1d4ed8' }}><PatentReferenceText value={linkedProjects.map(project => project.name || `项目 #${project.id}`).join('、')} onOpen={(number) => void handlePatentReferenceClick(number)} /></span>
+        : <span style={{ color: '#94a3b8' }}>未关联项目</span>
+    }
+
+    if (field.key === 'legal_status') {
+      const status = value as string
+      return (
+        <span className={`status-badge status-${status || 'unknown'}`}>
+          {getStatusText(status)}
+        </span>
+      )
+    }
+
+    if (field.key === 'risk_level' || field.key === 'has_risk') {
+      const hasRisk = patent.has_risk
+      const level = patent.risk_level
+      if (!hasRisk) return <span style={{ color: '#94a3b8', fontSize: 12 }}>-</span>
+      return (
+        <span className={`risk-badge risk-${level || 'low'}`}>
+          {getRiskText(level, hasRisk)}
+        </span>
+      )
+    }
+
+    if (field.key === 'title') {
+      return (
+        <div>
+          <div style={{ fontWeight: 500, color: '#2563eb', cursor: 'pointer' }}
+           onClick={(e) => { e.stopPropagation(); openPatent(patent.id) }}
+               onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.textDecoration = 'underline' }}
+               onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.textDecoration = 'none' }}
+          >
+            <PatentReferenceText
+              value={String(value ?? '-')}
+              onOpen={(number) => void handlePatentReferenceClick(number)}
+            />
+          </div>
+          {(patent.category || patent.subcategory) && (
+            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>
+              {patent.category}{patent.subcategory ? ` / ${patent.subcategory}` : ''}
+            </div>
+          )}
+          {isGlobalMasterTable && patent.database_names && patent.database_names.length > 0 && (
+            <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
+              所属库：{patent.database_names.join('、')}
+            </div>
+          )}
+        </div>
+      )
+    }
+
+    if (field.key === 'application_number' || field.key === 'publication_number') {
+      return (
+        <span
+          style={{ fontFamily: 'monospace', fontSize: 12, cursor: 'pointer', color: '#2563eb' }}
+           onClick={(e) => { e.stopPropagation(); openPatent(patent.id) }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.textDecoration = 'underline' }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.textDecoration = 'none' }}
+        >
+          {String(value ?? '-')}
+        </span>
+      )
+    }
+
+    const displayValue = formatValue(value, field)
+
+    return (
+      <span
+        style={{
+          color: displayValue === '-' ? '#94a3b8' : '#374151',
+          display: 'block',
+          whiteSpace: 'normal',
+          wordBreak: 'break-word',
+          overflowWrap: 'anywhere',
+          lineHeight: 1.5,
+        }}
+      >
+        <PatentReferenceText value={displayValue} onOpen={(number) => void handlePatentReferenceClick(number)} />
+      </span>
+    )
+  }
+
+  return (
+    <div className="workbench-shell" style={{ display: 'flex', height: '100%', background: '#f3f4f6' }}>
+      <aside className="workbench-view-sidebar" aria-label="工作台视图">
+        <ViewSwitcher onOpenView={() => undefined} />
+      </aside>
+      <div className="workbench-main" style={{ display: 'flex', flexDirection: 'column', position: 'relative', minWidth: 0, flex: 1 }}>
+      <div className="datagrid-toolbar">
+        <div className="datagrid-toolbar-heading">
+          {onOpenSidebar && (
+            <button
+              type="button"
+              className="mobile-nav-toggle patent-mobile-nav-toggle"
+              onClick={onOpenSidebar}
+              aria-label="打开导航"
+              title="打开导航"
+            >
+              <Icon name="menu" />
+            </button>
+          )}
+          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: '#111827' }}>
+            {activeView?.name || '专利列表'}
+          </h2>
+          <span className="datagrid-toolbar-count">
+            共 {totalPatents} 件{currentProductId ? ' · 当前产品筛选中' : ''}
+          </span>
+        </div>
+        <div className="datagrid-toolbar-body">
+          <div className="datagrid-search-row">
+          <div className="search-suggest-wrap">
+            <div className="semantic-search-mode" role="group" aria-label="检索模式">
+              {([['keyword', '关键词'], ['hybrid', '混合'], ['semantic', '语义']] as const).map(([mode, label]) => (
+                <button key={mode} type="button" className={searchMode === mode ? 'active' : ''} onClick={() => { setSearchMode(mode); setPage(1) }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <form className="datagrid-search-form" onSubmit={handleSearch}>
+              <input
+                type="text"
+                className="form-input datagrid-search-input"
+                placeholder={searchMode === 'semantic' ? '描述技术问题、方案或效果...' : searchMode === 'hybrid' ? '输入技术描述或专利号...' : '搜索专利号、标题、申请人...'}
+                value={searchInputText}
+                onChange={(e) => handleSearchInputChange(e.target.value)}
+                onKeyDown={handleSearchKeyDown}
+                aria-autocomplete="list"
+                aria-controls="patent-search-suggestions"
+              />
+              <button type="submit" className="btn btn-primary datagrid-search-submit" aria-label="执行检索">检索</button>
+            </form>
+            {searchSuggestions.length > 0 && (
+              <div id="patent-search-suggestions" className="search-suggest-menu" role="listbox">
+                {searchSuggestions.map((suggestion, index) => (
+                  <button
+                    type="button"
+                    key={`${suggestion.kind}-${suggestion.value}`}
+                    className={`search-suggest-item ${index === activeSuggestionIndex ? 'active' : ''}`}
+                    onMouseDown={event => event.preventDefault()}
+                    onClick={() => applySearchSuggestion(suggestion)}
+                    role="option"
+                    aria-selected={index === activeSuggestionIndex}
+                  >
+                    <span className="search-suggest-kind">{suggestion.kind_label}</span>
+                    <span className="search-suggest-value">{suggestion.label}</span>
+                    {suggestion.kind !== 'title' && <span className="search-suggest-title">{suggestion.patent_title}</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          {semanticNotice && <span className="semantic-search-notice">{semanticNotice}</span>}
+          <button
+            className={`btn btn-sm ${hasActiveFilters ? 'btn-primary' : 'btn-secondary'} datagrid-clear-filters`}
+            onClick={handleClearAllFilters}
+            style={{ display: hasActiveFilters ? 'inline-flex' : 'none' }}
+          >
+            清除筛选
+          </button>
+          </div>
+          <div className="datagrid-toolbar-actions">
+            {onOpenImport && (
+              <ToolbarMenu
+                label="导入管理"
+                icon="plus"
+                triggerClassName="btn btn-sm btn-primary datagrid-import-button"
+                title="导入数据、查看导入历史和数据治理"
+              >
+                {(close) => (
+                  <>
+                    <button type="button" className="menu-item" onClick={() => { close(); onOpenImport() }}><Icon name="plus" size={14} /> 新建导入</button>
+                    <button type="button" className="menu-item" onClick={() => { close(); navigate(activeDatabaseId ? `/db/${activeDatabaseId}/import-history${location.search}` : '/import-history') }}><Icon name="history" size={14} /> 导入历史</button>
+                    <button type="button" className="menu-item" onClick={() => { close(); navigate(activeDatabaseId ? `/db/${activeDatabaseId}/governance${location.search}` : '/governance') }}><Icon name="check" size={14} /> 数据治理</button>
+                  </>
+                )}
+              </ToolbarMenu>
+            )}
+            <div className="datagrid-view-actions" aria-label="常用表格工具">
+              <button type="button" className="btn btn-sm btn-secondary" onClick={() => setShowFieldConfig(true)} title="管理显示字段、顺序和冻结列"><Icon name="columns" size={14} /> 列管理</button>
+              {(tableViewMode === 'detail' || tableViewMode === 'full_image') && <button type="button" className="btn btn-sm btn-secondary" onClick={() => setShowDetailFieldConfig(true)} title="选择详情浏览显示的字段"><Icon name="file" size={14} /> 详情字段{configuredDetailKeys ? ` (${configuredDetailKeys.length})` : ''}</button>}
+              {activeView && activeView.layout_type === 'table' && (
+                <>
+                  <button type="button" className={`btn btn-sm ${getViewGroupFields(activeView).length > 0 ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setShowGroupConfig(true)} title="按字段分组并折叠展示"><Icon name="table" size={14} /> 分组</button>
+                  <button type="button" className={`btn btn-sm ${activeView.conditional_formatting?.length ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setShowConditionalConfig(true)} title="按条件突出显示单元格"><Icon name="filter" size={14} /> 条件格式</button>
+                </>
+              )}
+              {(activeView?.layout_type === 'table' || !activeView) && (
+                <button type="button" className="btn btn-sm btn-secondary datagrid-view-settings-button" onClick={() => setShowTableSettings(true)} title="设置查看模式和行高">
+                  <Icon name="sliders" size={14} /> 查看设置
+                  <span className="datagrid-view-settings-hint">
+                    {tableViewMode === 'continuous' ? '连续' : tableViewMode === 'detail' ? '详情' : tableViewMode === 'full_image' ? '全图' : '分页'} · {rowHeightLimit === 'auto' ? '自适应' : `${rowHeightLimit}px`}
+                  </span>
+                </button>
+              )}
+            </div>
+            {getViewGroupFields(activeView).length > 0 && (
+              <span className="view-tools-summary">
+                已按 {getViewGroupFields(activeView).map(item => fields.find(field => field.key === item.field)?.name || item.field).join(' / ')} 分组
+              </span>
+            )}
+            <ToolbarMenu label="分析" icon="chart" title="统计分析、AI 快速分析、JEV 快速标引">
+              {(close) => (
+                <>
+                  <button type="button" className="menu-item" onClick={() => { close(); setAnalysisScope(selectedIds.length ? 'selected' : 'view'); setShowPatentAnalysis(true) }} title="对当前视图或勾选专利进行统计分析"><Icon name="chart" /> 统计分析</button>
+                  <button type="button" className="menu-item menu-item-ai" onClick={() => { close(); setQuickAnalyzePatentIds(patents.map(p => p.id)); setShowQuickAnalyze(true) }} title="对当前已加载专利执行 AI 快速分析"><Icon name="sparkles" /> AI 快速分析</button>
+                  <button type="button" className="menu-item menu-item-ai" disabled={selectedIds.length !== 1} onClick={() => { close(); setJevAnalyzePatentIds(selectedIds); setShowJEVAnalyze(true) }} title={selectedIds.length === 1 ? '用 JEV 对选中专利做结构化分类和评分' : '请先选中一条专利'}><Icon name="sparkles" /> JEV 快速标引</button>
+                </>
+              )}
+            </ToolbarMenu>
+            <ToolbarMenu label="更多" icon="more-horizontal" title="同族聚拢、导出数据、工作文件等">
+              {(close) => (
+                <>
+                  <button type="button" className={`menu-item ${groupByFamily ? 'is-active' : ''}`} onClick={() => { close(); void handleFamilyGrouping() }} title="把同族专利聚拢显示"><Icon name="table" /> 同族聚拢 {groupByFamily ? '已开启' : '已关闭'}</button>
+                  <button type="button" className="menu-item" onClick={() => { close(); handleExport() }}><Icon name="download" /> 导出数据</button>
+                  {!isGlobalMasterTable && <button type="button" className="menu-item menu-item-primary" onClick={() => { close(); setShowWorkFileDialog(true) }} title="按业务模板生成 Excel、Word 或 CSV 工作文件"><Icon name="file" /> 工作文件</button>}
+                  {!isGlobalMasterTable && <>
+                    <div className="menu-divider" />
+                    <button type="button" className="menu-item menu-item-danger" onClick={() => { close(); setShowClearDatabase(true) }} title="清空当前库内的全部专利，保留库本身"><Icon name="trash" /> 清空当前库专利</button>
+                  </>}
+                </>
+              )}
+            </ToolbarMenu>
+            <div className="datagrid-history-actions" aria-label="编辑历史">
+              <button type="button" className="btn btn-sm btn-secondary" onClick={() => void handleUndo()} disabled={undoStack.length === 0 && !columnUndo} title="撤回最近一次编辑或列删除" aria-label="撤回">
+                <Icon name="undo" size={14} />
+              </button>
+              <button type="button" className="btn btn-sm btn-secondary" onClick={() => void handleRedo()} disabled={redoStack.length === 0 && !columnRedo} title="重做最近一次编辑或列删除" aria-label="重做">
+                <Icon name="redo" size={14} />
+              </button>
+            </div>
+            {viewConfigNotice && <span style={{ fontSize: 12, color: '#047857' }}>{viewConfigNotice}</span>}
+          </div>
+        </div>
+      </div>
+
+      {Object.keys(filterValues).length > 0 && (
+        <div className="filter-bar">
+          <span style={{ fontSize: 11, color: '#6b7280' }}>已筛选：</span>
+           {Object.entries(filterValues).filter(([, condition]) => filterConditionHasValue(condition)).map(([key, condition]) => {
+             const field = fields.find(f => f.key === key)
+             return (
+               <span key={key} className="filter-chip">
+                 {field?.name || key}: {FILTER_OPERATOR_LABELS[condition.operator]}{condition.value ? ` ${condition.value}` : ''}
+                 <span className="chip-remove" onClick={() => handleHeaderFilterClear(key)}>×</span>
+               </span>
+            )
+          })}
+        </div>
+      )}
+
+      {selectedIds.length > 0 && (
+        <div className="selection-bar">
+          <span className="selection-summary">
+            已选中 {selectedIds.length} 件专利
+          </span>
+          <div className="selection-actions">
+            <div className="selection-group" aria-label="AI 操作">
+              <button className="btn btn-xs btn-primary" onClick={() => { setQuickAnalyzePatentIds(selectedIds); setShowQuickAnalyze(true) }} title="对选中专利执行 AI 快速分析">
+                <Icon name="sparkles" size={13} /> AI 快速分析
+              </button>
+              {selectedIds.length === 1 && (
+                <button className="btn btn-xs btn-secondary" onClick={() => { setJevAnalyzePatentIds(selectedIds); setShowJEVAnalyze(true) }} title="对选中专利进行结构化分类、评分和复核判断">
+                  <Icon name="sparkles" size={13} /> JEV 标引
+                </button>
+              )}
+            </div>
+            <span className="selection-divider" aria-hidden="true" />
+            <div className="selection-group" aria-label="批量编辑与更新">
+              <button className="btn btn-xs btn-primary" onClick={() => navigate(`${activeDatabaseId ? `/db/${activeDatabaseId}` : ''}/external-sync?mode=publication&patent_ids=${selectedIds.join(',')}`)} title="把选中的专利公开号带入 MCP 跟踪确认"><Icon name="refresh" size={13} /> 加入 MCP 跟踪</button>
+              <button className="btn btn-xs btn-secondary" onClick={() => { setAddToViewId(null); setShowAddToView(true) }} title="把选中的专利加入一个或多个业务视图">
+                <Icon name="table" size={13} /> 加入业务视图
+              </button>
+              <button className="btn btn-xs btn-secondary" onClick={() => setShowBulkEdit(true)} title="批量修改选中专利的字段值">
+                <Icon name="edit" size={13} /> 批量编辑
+              </button>
+              <button className="btn btn-xs btn-secondary" onClick={() => setShowBulkTag(true)} title="为选中专利批量添加或移除标签">
+                <Icon name="tag" size={13} /> 批量打标签
+              </button>
+              {!isGlobalMasterTable && <button className="btn btn-xs btn-primary" onClick={() => void openSyncUpdate(selectedIds)} title="从外部数据源预览并确认覆盖更新">
+                <Icon name="refresh" size={13} /> 外部更新
+              </button>}
+            </div>
+            <span className="selection-divider" aria-hidden="true" />
+            <div className="selection-group" aria-label="移动与更多操作">
+              <ToolbarMenu label={isGlobalMasterTable ? '批量复制' : '批量移动'} icon={isGlobalMasterTable ? 'copy' : 'move'} triggerClassName="btn btn-xs btn-secondary" title={isGlobalMasterTable ? '复制所选专利到指定库' : '移动到视图、移库或复制为工作副本'}>
+                {(close) => (
+                  <>
+                    {!isGlobalMasterTable && <button type="button" className="menu-item" onClick={() => { close(); openBulkTransfer('move_view') }}><Icon name="move" /> 移动到视图</button>}
+                    {!isGlobalMasterTable && <button type="button" className="menu-item" onClick={() => { close(); openBulkTransfer('move_database') }}><Icon name="database" /> 移库</button>}
+                    <button type="button" className="menu-item" onClick={() => { close(); openBulkTransfer('duplicate') }}><Icon name="copy" /> 复制为工作副本</button>
+                  </>
+                )}
+              </ToolbarMenu>
+              <ToolbarMenu label="更多" icon="more-horizontal" triggerClassName="btn btn-xs btn-secondary" title="批量回滚、批量删除">
+                {(close) => (
+                  <>
+                    <button type="button" className="menu-item" onClick={() => { close(); void handleBulkRollbackBefore() }} title="恢复到指定时间之前的记录"><Icon name="history" /> 批量回滚</button>
+                    <div className="menu-divider" />
+                    <button type="button" className="menu-item menu-item-danger" onClick={() => { close(); handleBulkDelete() }}><Icon name="trash" /> 批量删除</button>
+                  </>
+                )}
+              </ToolbarMenu>
+            </div>
+          </div>
+          <button className="btn btn-xs btn-ghost selection-clear" onClick={clearSelection}>
+            取消选择
+          </button>
+        </div>
+      )}
+
+      <div ref={tableWrapperRef} className="data-grid-wrapper" onScroll={handleTableScroll} style={{ zoom: tableZoom / 100 }}>
+        {activeView?.layout_type === 'kanban' ? (
+          <KanbanView
+            view={activeView}
+            fields={fields}
+            onPatentClick={onPatentClick}
+            onViewChange={handleViewChange}
+            onTotalChange={handleKanbanTotalChange}
+          />
+        ) : activeView?.layout_type === 'form' ? (
+          <FormView view={activeView} onViewChange={handleViewChange} />
+        ) : activeView?.layout_type === 'gantt' ? (
+          <GanttView
+            view={activeView}
+            fields={fields}
+            onPatentClick={onPatentClick}
+            onViewChange={handleViewChange}
+            onTotalChange={handleKanbanTotalChange}
+          />
+        ) : loading ? (
+          <div className="loading-state">
+            <div className="spinner" style={{ width: 24, height: 24, borderWidth: 2, marginBottom: 12 }}></div>
+            <span style={{ fontSize: 13, color: '#6b7280' }}>加载中...</span>
+          </div>
+        ) : patents.length === 0 ? (
+          <div className="empty-state patent-empty-state">
+            <div className="empty-state-icon" aria-hidden="true">[ ]</div>
+            <div style={{ fontSize: 15, fontWeight: 500, color: '#374151', marginBottom: 6 }}>暂无专利数据</div>
+            <div style={{ fontSize: 13, color: '#9ca3af' }}>点击右上角"导入"按钮导入专利数据，或先在左侧创建产品分类</div>
+          </div>
+        ) : tableViewMode === 'detail' || tableViewMode === 'full_image' ? (
+          <div className={`patent-detail-browser ${tableViewMode === 'full_image' ? 'is-full-image' : ''}`}>
+            {familyDisplayPatents.map((patent, rowIdx) => {
+              // 详情模式同样遵循同族聚拢——族首显示分组标签，行内显示同族徽章。
+              const familyKey = groupByFamily && patent.family_id ? `family:${patent.family_id}` : null
+              const isFamilyStart = !!familyKey && familyFirstIds.has(patent.id)
+              const isFamilyCollapsed = !!familyKey && collapsedFamilyKeys.has(familyKey)
+              if (familyKey && isFamilyCollapsed && !isFamilyStart) return null
+              return (
+                <Fragment key={patent.id}>
+                  {isFamilyStart && (
+                    <div
+                      className="patent-detail-browser-family-header"
+                      onClick={() => setCollapsedFamilyKeys(previous => {
+                        const next = new Set(previous)
+                        if (familyKey && next.has(familyKey)) next.delete(familyKey)
+                        else if (familyKey) next.add(familyKey)
+                        return next
+                      })}
+                    >
+                      <span className="family-group-toggle">{isFamilyCollapsed ? '›' : '⌄'}</span>
+                      <strong>{patent.family_key || `同族 ${patent.family_id}`}</strong>
+                      <span className="family-group-count">{patent.family_size || 1} 件独立专利</span>
+                    </div>
+                  )}
+                  <article className="patent-detail-browser-row" key={patent.id}>
+                    <div className="patent-detail-browser-heading">
+                      <label className="patent-detail-browser-select" onClick={event => event.stopPropagation()}>
+                        <input type="checkbox" checked={selectedIds.includes(patent.id)} onChange={() => toggleSelect(patent.id)} aria-label={`选择第 ${(page - 1) * pageSize + rowIdx + 1} 条专利`} />
+                        <span>{(page - 1) * pageSize + rowIdx + 1}</span>
+                      </label>
+                      <button type="button" className="patent-detail-browser-title" onClick={() => openPatent(patent.id)}>
+                        {patent.title || patent.publication_number || `专利 #${patent.id}`}
+                      </button>
+                      <span className="patent-detail-browser-meta">
+                        <span className="patent-detail-browser-identity">{patent.publication_number || '无公开号'}</span>
+                        {groupByFamily && patent.family_id && (
+                          <span
+                            className="family-badge"
+                            title={`同族 ${patent.family_id}，共 ${patent.family_size ?? 1} 件`}
+                          >
+                            族{patent.family_id}{patent.family_size ? `·${patent.family_size}` : ''}
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    {rowImages(patent).length > 0 && <PatentImageStrip attachments={rowImages(patent)} maxImages={tableViewMode === 'detail' ? 1 : undefined} />}
+                    <div className="patent-detail-browser-fields">
+                      {detailVisibleFields.map(field => (
+                        <section className="patent-detail-browser-field" key={field.key}>
+                          <span className="patent-detail-browser-field-label">{field.name}</span>
+                          <div className="patent-detail-browser-field-value">{renderCellContent(patent, field)}</div>
+                        </section>
+                      ))}
+                    </div>
+                  </article>
+                </Fragment>
+              )
+            })}
+          </div>
+        ) : (
+          <table className="data-grid" style={{ width: 'max-content', minWidth: '100%' }}>
+            <colgroup>
+              <col style={{ width: CHECKBOX_COLUMN_WIDTH }} />
+              <col style={{ width: INDEX_COLUMN_WIDTH }} />
+              <col style={{ width: ACTION_COLUMN_WIDTH }} />
+              {visibleFields.map(field => <col key={field.key} style={{ width: columnWidths[field.key] || DEFAULT_COLUMN_WIDTH }} />)}
+            </colgroup>
+            <thead>
+              <tr>
+                <th className="col-checkbox" style={{ width: CHECKBOX_COLUMN_WIDTH, minWidth: CHECKBOX_COLUMN_WIDTH, maxWidth: CHECKBOX_COLUMN_WIDTH }}>
+                  <div className="col-select-header">
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      ref={element => { if (element) element.indeterminate = someSelected && !allSelected }}
+                      onChange={handleSelectAll}
+                      title={allSelected ? '取消勾选当前页' : '勾选当前页'}
+                    />
+                    <button
+                      type="button"
+                      className="col-select-caret"
+                      aria-label="选择勾选范围"
+                      aria-expanded={!!selectScopeMenu}
+                      title="选择勾选范围：当前页 / 当前库全部 / 按序号范围"
+                      onClick={handleHeaderSelectClick}
+                    >
+                      <Icon name="chevron-down" size={11} />
+                    </button>
+                  </div>
+                </th>
+                <th className="col-sequence" style={{ width: INDEX_COLUMN_WIDTH, minWidth: INDEX_COLUMN_WIDTH, maxWidth: INDEX_COLUMN_WIDTH, position: 'sticky', left: CHECKBOX_COLUMN_WIDTH, zIndex: 17, background: '#f9fafb' }}>
+                  <span style={{ fontSize: 12, color: '#6b7280' }}>序号</span>
+                </th>
+                <th className="col-action col-ai-action" style={{ width: ACTION_COLUMN_WIDTH, minWidth: ACTION_COLUMN_WIDTH, maxWidth: ACTION_COLUMN_WIDTH, position: 'sticky', left: CHECKBOX_COLUMN_WIDTH + INDEX_COLUMN_WIDTH, zIndex: 16, background: '#f9fafb' }}>
+                  <span style={{ fontSize: 12, color: '#2563eb', padding: '0 10px' }}><Icon name="sparkles" size={13} /> AI</span>
+                </th>
+                {visibleFields.map(field => {
+                  const hasFilter = filterConditionHasValue(filterValues[field.key])
+                  const isFilterable = field.filterable !== false
+                  const isFrozen = frozenFields.has(field.key)
+                  // 冻结列从序号和 AI 操作列之后开始排列。
+                  let leftOffset = CHECKBOX_COLUMN_WIDTH + INDEX_COLUMN_WIDTH + ACTION_COLUMN_WIDTH
+                  if (isFrozen) {
+                    for (const f of visibleFields) {
+                      if (f.key === field.key) break
+                      if (frozenFields.has(f.key)) {
+                        leftOffset += columnWidths[f.key] || DEFAULT_COLUMN_WIDTH
+                      }
+                    }
+                  }
+                  return (
+                    <th
+                      key={field.key}
+                      className={`${isFrozen ? 'col-frozen' : ''} ${sortField === field.key ? 'col-sorted' : ''} ${hasFilter ? 'col-filtered' : ''} ${activeCell?.fieldKey === field.key ? 'crosshair-column-header' : ''}`}
+                      style={{
+                        width: columnWidths[field.key] || DEFAULT_COLUMN_WIDTH,
+                        minWidth: 80,
+                        ...(isFrozen ? { position: 'sticky', left: leftOffset, zIndex: 15, background: '#f9fafb' } : {}),
+                      }}
+                      onContextMenu={(e) => handleContextMenu(e, 'header', { fieldKey: field.key })}
+                    >
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          height: '100%',
+                          padding: '0 10px',
+                          cursor: 'pointer',
+                          minHeight: 34,
+                        }}
+                        onClick={() => {
+                          const firstPatent = patents[0]
+                          if (firstPatent) setActiveCell({ patentId: firstPatent.id, fieldKey: field.key })
+                          setActiveHeaderMenu(null)
+                        }}
+                      >
+                        <span style={{
+                          fontSize: 12,
+                          fontWeight: 500,
+                          color: sortField === field.key ? '#111827' : hasFilter ? '#2563eb' : '#6b7280',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          flex: 1,
+                        }}>
+                          {field.name}
+                          {sortField === field.key && (
+                            <span style={{ marginLeft: 4, fontSize: 10, color: '#3b82f6' }}>
+                              {sortOrder === 'asc' ? '↑' : '↓'}
+                            </span>
+                          )}
+                          {hasFilter && (
+                            <span style={{ marginLeft: 4, fontSize: 10, color: '#2563eb' }}>●</span>
+                          )}
+                        </span>
+                        <button
+                          className="col-header-trigger"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            if (activeHeaderMenu === field.key) {
+                              setActiveHeaderMenu(null)
+                              setHeaderFilterText('')
+                            } else {
+                              setActiveHeaderMenu(field.key)
+                              const existingFilter = filterValues[field.key]
+                              setHeaderFilterOperator(existingFilter?.operator || 'contains')
+                              setHeaderFilterText(existingFilter?.value || '')
+                            }
+                          }}
+                          style={{
+                            width: 20,
+                            height: 20,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            border: 'none',
+                            background: 'transparent',
+                            cursor: 'pointer',
+                            color: hasFilter ? '#2563eb' : '#9ca3af',
+                            borderRadius: 3,
+                            fontSize: 14,
+                            flexShrink: 0,
+                            marginLeft: 4,
+                          }}
+                          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = '#e5e7eb' }}
+                          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
+                        >
+                          ▾
+                        </button>
+                      </div>
+                      <div
+                        className="col-resize-handle"
+                        onPointerDown={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          setResizing({
+                            fieldKey: field.key,
+                            startX: e.clientX,
+                            startWidth: columnWidths[field.key] || DEFAULT_COLUMN_WIDTH,
+                          })
+                        }}
+                        title="拖动调整列宽"
+                      />
+                      {activeHeaderMenu === field.key && (
+                        <div className="col-header-menu" onClick={e => e.stopPropagation()}>
+                          {isFilterable && (
+                            <div style={{ padding: '8px 10px', borderBottom: '1px solid #f3f4f6' }}>
+                              <div style={{ fontSize: 10, color: '#9ca3af', marginBottom: 4 }}>筛选 {field.name}</div>
+                              <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                                <select
+                                  value={headerFilterOperator}
+                                  onChange={(e) => setHeaderFilterOperator(e.target.value as FilterOperator)}
+                                  style={{ padding: '4px 5px', border: '1px solid #d1d5db', borderRadius: 4, fontSize: 12, background: '#fff' }}
+                                >
+                                  {Object.entries(FILTER_OPERATOR_LABELS).map(([operator, label]) => (
+                                    <option key={operator} value={operator}>{label}</option>
+                                  ))}
+                                </select>
+                                <input
+                                  type="text"
+                                  placeholder={headerFilterOperator === 'is_empty' || headerFilterOperator === 'is_not_empty' ? '无需输入值' : '输入关键词...'}
+                                  value={headerFilterText}
+                                  onChange={(e) => setHeaderFilterText(e.target.value)}
+                                  disabled={headerFilterOperator === 'is_empty' || headerFilterOperator === 'is_not_empty'}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') handleHeaderFilterApply(field.key)
+                                    if (e.key === 'Escape') { setActiveHeaderMenu(null); setHeaderFilterText('') }
+                                  }}
+                                  autoFocus
+                                  style={{
+                                    flex: 1,
+                                    padding: '4px 8px',
+                                    border: '1px solid #d1d5db',
+                                    borderRadius: 4,
+                                    fontSize: 12,
+                                    outline: 'none',
+                                    minWidth: 120,
+                                  }}
+                                />
+                                <button
+                                  className="btn btn-xs btn-primary"
+                                  onClick={() => handleHeaderFilterApply(field.key)}
+                                >
+                                  确定
+                                </button>
+                              </div>
+                              {hasFilter && (
+                                <button
+                                  className="btn btn-xs btn-ghost"
+                                  onClick={() => handleHeaderFilterClear(field.key)}
+                                  style={{ fontSize: 11, padding: '2px 0', marginTop: 4, color: '#dc2626' }}
+                                >
+                                  清除此列筛选
+                                </button>
+                              )}
+                            </div>
+                          )}
+                          <div
+                            className="menu-item"
+                            onClick={() => handleSort(field.key)}
+                          >
+                            <span>{sortField === field.key && sortOrder === 'asc' ? '↓ 降序排列' : '↑ 升序排列'}</span>
+                          </div>
+                          <div className="menu-divider" />
+                          <div className="menu-item" onClick={() => openInsertAIDialog('text', field.key, 'before')}>
+                            <span style={{ color: '#2563eb' }}><Icon name="columns" /> 左侧插入新列</span>
+                          </div>
+                          <div className="menu-item" onClick={() => openInsertAIDialog('text', field.key, 'after')}>
+                            <span style={{ color: '#2563eb' }}><Icon name="columns" /> 右侧插入新列</span>
+                          </div>
+                          <div
+                            className="menu-item"
+                            onClick={() => handleToggleFreeze(field.key)}
+                          >
+                            <span><Icon name={frozenFields.has(field.key) ? 'unlock' : 'lock'} /> {frozenFields.has(field.key) ? '取消冻结' : '冻结此列'}</span>
+                          </div>
+                          <div
+                            className="menu-item"
+                            onClick={() => openColumnStats(field.key)}
+                          >
+                            <span style={{ color: '#0891b2' }}><Icon name="chart" /> 统计此列</span>
+                          </div>
+                          <div
+                            className="menu-item"
+                            onClick={() => handleToggleFieldVisible(field.key)}
+                          >
+                            <span>隐藏此列</span>
+                          </div>
+                        </div>
+                      )}
+                    </th>
+                  )
+                })}
+              </tr>
+            </thead>
+            <tbody>
+              {familyDisplayPatents.map((p, rowIdx) => {
+                // 同族聚拢模式下，为同族组交替背景色 + 行首徽章
+                const familyBgColors = ['#faf5ff', '#eff6ff', '#f0fdf4', '#fefce8', '#fff7ed', '#fdf2f8']
+                let rowBg: string | undefined
+                let familyBadge: React.ReactNode = null
+                if (groupByFamily && p.family_id) {
+                  // 同族组用 family_id 哈希到颜色槽，保证同族同色
+                  const colorSlot = p.family_id % familyBgColors.length
+                  rowBg = familyBgColors[colorSlot]
+                  // 检测同族组首行（前一行 family_id 不同）
+                  const prevFamilyId = rowIdx > 0 ? familyDisplayPatents[rowIdx - 1].family_id : undefined
+                  const isGroupStart = prevFamilyId !== p.family_id
+                  if (isGroupStart) {
+                    familyBadge = (
+                      <span
+                        style={{
+                          display: 'inline-block',
+                          background: '#7c3aed',
+                          color: '#fff',
+                          fontSize: 10,
+                          fontWeight: 600,
+                          padding: '1px 5px',
+                          borderRadius: 8,
+                          marginRight: 4,
+                          verticalAlign: 'middle',
+                        }}
+                        title={`同族 ${p.family_id}，共 ${p.family_size ?? 1} 件`}
+                      >
+                        族{p.family_id}{p.family_size ? `·${p.family_size}` : ''}
+                      </span>
+                    )
+                  }
+                }
+                const groupHeaders = groupPresentation?.headers.get(p.id) || []
+                const isGroupRowCollapsed = groupHeaders.some(header => collapsedGroupKeys.has(header.id))
+                const familyKey = p.family_id ? `family:${p.family_id}` : null
+                const isFamilyStart = groupByFamily && !!p.family_id && familyFirstIds.has(p.id)
+                const isFamilyRowCollapsed = !!familyKey && collapsedFamilyKeys.has(familyKey)
+                return (
+                <Fragment key={p.id}>
+                {groupHeaders.map(groupHeader => (
+                  <tr
+                    key={groupHeader.id}
+                    className="view-group-header"
+                    onClick={() => setCollapsedGroupKeys(previous => {
+                      const next = new Set(previous)
+                      if (next.has(groupHeader.id)) next.delete(groupHeader.id)
+                      else next.add(groupHeader.id)
+                      return next
+                    })}
+                  >
+                    <td colSpan={visibleFields.length + 3} style={{ padding: '8px 12px', background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#334155', cursor: 'pointer', fontWeight: 600 }}>
+                      <span style={{ display: 'inline-block', width: 18, color: '#64748b' }}>{collapsedGroupKeys.has(groupHeader.id) ? '›' : '⌄'}</span>
+                      {groupHeader.label}
+                      <span style={{ marginLeft: 8, color: '#94a3b8', fontWeight: 400 }}>{groupHeader.count} 条</span>
+                    </td>
+                  </tr>
+                ))}
+                {isFamilyStart && (
+                  <tr
+                    className="family-group-header"
+                    onClick={() => setCollapsedFamilyKeys(previous => {
+                      const next = new Set(previous)
+                      if (familyKey && next.has(familyKey)) next.delete(familyKey)
+                      else if (familyKey) next.add(familyKey)
+                      return next
+                    })}
+                  >
+                    <td colSpan={visibleFields.length + 3}>
+                      <span className="family-group-toggle">{familyKey && collapsedFamilyKeys.has(familyKey) ? '›' : '⌄'}</span>
+                      <strong>{p.family_key || `同族 ${p.family_id}`}</strong>
+                      <span className="family-group-count">{p.family_size || 1} 件独立专利</span>
+                    </td>
+                  </tr>
+                )}
+                {!isGroupRowCollapsed && !isFamilyRowCollapsed && (
+                <tr
+                  key={p.id}
+                  className={`${selectedIds.includes(p.id) ? 'row-selected ' : ''}${rowHeightLimit === 'auto' ? '' : 'row-height-capped'}${activeCell?.patentId === p.id ? ' crosshair-row' : ''}`}
+                  onClick={(e) => {
+                    if ((e.target as HTMLElement).closest('input') ||
+                        (e.target as HTMLElement).closest('select') ||
+                        (e.target as HTMLElement).closest('textarea') ||
+                        (e.target as HTMLElement).closest('button') ||
+                        (e.target as HTMLElement).closest('.cell-action-btn')) return
+                    openPatent(p.id)
+                  }}
+                  onContextMenu={(e) => handleContextMenu(e, 'row', { patentId: p.id })}
+                  style={{
+                    cursor: 'pointer',
+                    background: rowBg,
+                    ...(rowHeightLimit === 'auto' ? {} : { '--row-max-height': `${rowHeightLimit}px` } as React.CSSProperties),
+                  }}
+                >
+                  <td className={`col-checkbox ${activeCell?.patentId === p.id ? 'crosshair-row-cell' : ''}`}>
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.includes(p.id)}
+                      onChange={() => toggleSelect(p.id)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                    {familyBadge}
+                  </td>
+                  <td
+                    className={`col-sequence ${activeCell?.patentId === p.id ? 'crosshair-row-cell' : ''}`}
+                    style={{ width: INDEX_COLUMN_WIDTH, minWidth: INDEX_COLUMN_WIDTH, maxWidth: INDEX_COLUMN_WIDTH, position: 'sticky', left: CHECKBOX_COLUMN_WIDTH, zIndex: 7, background: '#fff', textAlign: 'center', color: '#64748b', fontVariantNumeric: 'tabular-nums' }}
+                  >
+                    {(tableViewMode !== 'continuous' ? (page - 1) * pageSize : 0) + rowIdx + 1}
+                  </td>
+                  <td className={`col-action ${activeCell?.patentId === p.id ? 'crosshair-row-cell' : ''}`} style={{ width: ACTION_COLUMN_WIDTH, minWidth: ACTION_COLUMN_WIDTH, maxWidth: ACTION_COLUMN_WIDTH, position: 'sticky', left: CHECKBOX_COLUMN_WIDTH + INDEX_COLUMN_WIDTH, zIndex: 6, background: '#fff', padding: '4px 6px' }}>
+                    <div style={{ display: 'flex', gap: 2 }}>
+                      <button
+                        className="cell-action-btn"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleQuickAI(p.id)
+                        }}
+                        disabled={aiProcessingRow === p.id}
+                        style={{
+                          width: 26,
+                          height: 26,
+                          border: '1px solid #bfdbfe',
+                          background: aiProcessingRow === p.id ? '#dbeafe' : '#eff6ff',
+                          color: aiProcessingRow === p.id ? '#93c5fd' : '#2563eb',
+                          borderRadius: 4,
+                          cursor: aiProcessingRow === p.id ? 'wait' : 'pointer',
+                          fontSize: 12,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          padding: 0,
+                        }}
+                        title="AI快速分析"
+                      >
+                        <Icon name={aiProcessingRow === p.id ? 'refresh' : 'sparkles'} size={14} />
+                      </button>
+                      <button
+                        className="cell-action-btn"
+                        onClick={(e) => { e.stopPropagation(); void openSyncUpdate([p.id]) }}
+                        style={{
+                          width: 26,
+                          height: 26,
+                          border: '1px solid #bbf7d0',
+                          background: '#f0fdf4',
+                          color: '#15803d',
+                          borderRadius: 4,
+                          cursor: 'pointer',
+                          fontSize: 12,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          padding: 0,
+                        }}
+                        title="外部更新：预览并确认覆盖"
+                      >
+                        <Icon name="refresh" size={14} />
+                      </button>
+                    </div>
+                  </td>
+                  {visibleFields.map(field => {
+                    const isFrozen = frozenFields.has(field.key)
+                    const cellIsEditing = editingCell?.patentId === p.id && editingCell.fieldKey === field.key
+                    let leftOffset = CHECKBOX_COLUMN_WIDTH + INDEX_COLUMN_WIDTH + ACTION_COLUMN_WIDTH
+                    if (isFrozen) {
+                      for (const f of visibleFields) {
+                        if (f.key === field.key) break
+                        if (frozenFields.has(f.key)) {
+                          leftOffset += columnWidths[f.key] || DEFAULT_COLUMN_WIDTH
+                        }
+                      }
+                    }
+                    return (
+                    <td
+                      key={field.key}
+                      className={`${isFrozen ? 'col-frozen' : ''} ${field.editable ? 'cell-editable' : ''} ${cellIsEditing ? 'cell-editing' : ''} ${activeCell?.patentId === p.id ? 'crosshair-row-cell' : ''} ${activeCell?.fieldKey === field.key ? 'crosshair-column-cell' : ''} ${activeCell?.patentId === p.id && activeCell?.fieldKey === field.key ? 'crosshair-cell' : ''}`}
+                      style={{
+                        width: columnWidths[field.key] || DEFAULT_COLUMN_WIDTH,
+                        padding: field.field_type === 'longtext' ? '8px 10px' : '6px 10px',
+                        whiteSpace: 'normal',
+                        wordBreak: 'break-word',
+                        overflowWrap: 'anywhere',
+                        verticalAlign: 'top',
+                        position: 'relative',
+                        ...(isFrozen ? { position: 'sticky', left: leftOffset, zIndex: 5, background: '#fff' } : {}),
+                        ...getConditionalCellStyle(field.key, getFieldValue(p, field.key)),
+                      }}
+                      onMouseDown={() => setActiveCell({ patentId: p.id, fieldKey: field.key })}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setActiveCell({ patentId: p.id, fieldKey: field.key })
+                      }}
+                      onDoubleClick={(e) => {
+                        e.stopPropagation()
+                        handleCellClick(p.id, field.key, e)
+                      }}
+                      onContextMenu={(e) => handleContextMenu(e, 'row', { patentId: p.id, fieldKey: field.key })}
+                    >
+                      <div className={`cell-value-shell${cellIsEditing ? ' cell-value-shell-editing' : ''}`}>{renderCellContent(p, field)}</div>
+                    </td>
+                    )
+                  })}
+                </tr>
+                )}
+                {!isGroupRowCollapsed && !isFamilyRowCollapsed && rowImages(p).length > 0 && (
+                  <tr className="patent-image-strip-row" key={`${p.id}-images`}>
+                    <td colSpan={visibleFields.length + 3}>
+                      <PatentImageStrip attachments={rowImages(p)} />
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {(activeView?.layout_type === 'table' || !activeView) && !(scrollEdges.atTop && scrollEdges.atBottom) && (
+        <div className="datagrid-scroll-fab" role="group" aria-label="滚动到顶部或底部">
+          <button type="button" className="btn btn-sm btn-secondary" onClick={() => scrollLibraryTo('top')} disabled={scrollEdges.atTop} title="滚动到库顶部（Ctrl/Cmd + Home）" aria-label="滚动到库顶部"><Icon name="chevron-up" size={16} /></button>
+          <button type="button" className="btn btn-sm btn-secondary" onClick={() => scrollLibraryTo('bottom')} disabled={scrollEdges.atBottom} title="滚动到库底部（Ctrl/Cmd + End）" aria-label="滚动到库底部"><Icon name="chevron-down" size={16} /></button>
+        </div>
+      )}
+
+      {(activeView?.layout_type === 'table' || !activeView) && <div className="datagrid-footer">
+        {tableViewMode === 'continuous' ? (
+          <span style={{ fontSize: 12, color: '#6b7280' }}>
+            已加载 {patents.length} / 共 {totalPatents} 条
+            {continuousLoading && <span style={{ marginLeft: 8, color: '#0f766e' }}>正在加载...</span>}
+            {!continuousLoading && patents.length >= totalPatents && totalPatents > 0 && <span style={{ marginLeft: 8, color: '#94a3b8' }}>已加载全部记录</span>}
+          </span>
+        ) : (
+          <span style={{ fontSize: 12, color: '#6b7280' }}>
+            第 {totalPatents === 0 ? 0 : (page - 1) * pageSize + 1} - {Math.min(page * pageSize, totalPatents)} 条，共 {totalPatents} 条
+          </span>
+        )}
+        {tableViewMode !== 'continuous' && <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+          <button
+            className="btn btn-xs btn-secondary"
+            disabled={page <= 1}
+            onClick={() => setPage(page - 1)}
+          >
+            上一页
+          </button>
+          {pageNumbers().map((p, idx) =>
+            typeof p === 'number' ? (
+              <button
+                key={idx}
+                className="btn btn-xs"
+                onClick={() => setPage(p)}
+                style={{
+                  padding: '2px 7px',
+                  minWidth: 24,
+                  background: p === page ? '#2563eb' : '#fff',
+                  color: p === page ? '#fff' : '#374151',
+                  border: `1px solid ${p === page ? '#2563eb' : '#d1d5db'}`,
+                  fontWeight: p === page ? 600 : 400,
+                }}
+              >
+                {p}
+              </button>
+            ) : (
+              <span key={idx} style={{ fontSize: 12, color: '#9ca3af', padding: '0 2px' }}>…</span>
+            )
+          )}
+          <button
+            className="btn btn-xs btn-secondary"
+            disabled={page >= totalPages}
+            onClick={() => setPage(page + 1)}
+          >
+            下一页
+          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 8 }}>
+            <span style={{ fontSize: 12, color: '#6b7280' }}>跳至</span>
+            <input
+              type="number"
+              min={1}
+              max={totalPages}
+              value={pageInputValue}
+              onChange={(e) => setPageInputValue(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handlePageJump() }}
+              onBlur={handlePageJump}
+              style={{
+                width: 48,
+                height: 24,
+                padding: '0 6px',
+                border: '1px solid #d1d5db',
+                borderRadius: 4,
+                fontSize: 12,
+                textAlign: 'center',
+                outline: 'none',
+              }}
+            />
+            <span style={{ fontSize: 12, color: '#6b7280' }}>页</span>
+          </div>
+        </div>}
+      </div>}
+
+      {pendingColumnDelete && (
+        <Modal title="确认移除列" onClose={() => setPendingColumnDelete(null)} width={460}>
+          {(() => {
+            const field = fields.find(item => item.key === pendingColumnDelete)
+            if (!field) return <div className="empty-state">列不存在或已被移除。</div>
+            return (
+              <>
+                <p style={{ margin: '0 0 10px', color: '#334155', fontSize: 13 }}>确定从当前表格移除“{field.name}”吗？</p>
+                <p style={{ margin: 0, color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>这只会隐藏当前表格中的列，专利数据和已有内容会保留。操作完成后可以使用工具栏的撤回按钮恢复。</p>
+                <div className="modal-footer" style={{ margin: '18px -20px -20px' }}>
+                  <button type="button" className="btn btn-secondary" onClick={() => setPendingColumnDelete(null)}>取消</button>
+                  <button type="button" className="btn btn-danger" onClick={() => { const key = pendingColumnDelete; setPendingColumnDelete(null); void deleteColumnByKey(key) }}>确认移除</button>
+                </div>
+              </>
+            )
+          })()}
+        </Modal>
+      )}
+
+      {showFieldConfig && activeView && (
+        <ViewColumnConfigPanel
+          key={activeView.id}
+          open
+          view={activeView}
+          fields={fields}
+          onClose={() => setShowFieldConfig(false)}
+          onSave={saveViewColumnConfig}
+          onRemove={requestDeleteColumnByKey}
+        />
+      )}
+
+      {showTableSettings && (
+        <Modal title="查看设置" onClose={() => setShowTableSettings(false)} width={460}>
+          <div className="table-settings-modal">
+            <section>
+              <h4>查看模式</h4>
+              <div className="table-settings-choice-grid">
+                {([
+                  ['pagination', '分页模式', '适合逐页核对和批量处理'],
+                  ['continuous', '连续滚动', '像 Excel 一样向下浏览并加载'],
+                  ['detail', '详情浏览', '每条专利纵向展示所选字段内容'],
+                  ['full_image', '全图浏览', '详情内容与全部图片缩略图'],
+                ] as const).map(([value, label, description]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    className={`table-settings-choice ${tableViewMode === value ? 'active' : ''}`}
+                    onClick={() => handleTableViewModeChange(value)}
+                  >
+                    <strong>{label}</strong>
+                    <span>{description}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+            <section>
+              <h4>行高上限</h4>
+              <div className="table-settings-row-height">
+                {(['auto', 56, 72, 96, 120] as const).map(value => (
+                  <button
+                    key={String(value)}
+                    type="button"
+                    className={`btn btn-sm ${rowHeightLimit === value ? 'btn-primary' : 'btn-secondary'}`}
+                    onClick={() => handleRowHeightLimitChange(value)}
+                  >
+                    {value === 'auto' ? '自适应' : `${value}px`}
+                  </button>
+                ))}
+              </div>
+              <p className="table-settings-note">限制单元格展开高度，完整内容仍可在详情页查看。</p>
+            </section>
+            <section>
+              <h4>表格缩放</h4>
+              <div className="table-zoom-control">
+                <button type="button" className="btn btn-sm btn-secondary" onClick={() => handleTableZoomChange(tableZoom - 5)} disabled={tableZoom <= 75}>−</button>
+                <input type="range" min={75} max={150} step={5} value={tableZoom} onChange={event => handleTableZoomChange(Number(event.target.value))} aria-label="表格缩放比例" />
+                <button type="button" className="btn btn-sm btn-secondary" onClick={() => handleTableZoomChange(tableZoom + 5)} disabled={tableZoom >= 150}>＋</button>
+                <strong>{tableZoom}%</strong>
+                <button type="button" className="btn btn-sm btn-ghost" onClick={() => handleTableZoomChange(100)}>重置</button>
+              </div>
+              <p className="table-settings-note">缩放表格内容以调整同一屏幕中可见的列和数据量。</p>
+            </section>
+          </div>
+        </Modal>
+      )}
+
+      {showFieldConfig && !activeView && (
+        <ColumnConfigPanel
+          open
+          fields={fields}
+          frozenFields={frozenFields}
+          onClose={() => setShowFieldConfig(false)}
+          onToggleVisible={handleToggleFieldVisible}
+          onToggleFreeze={handleToggleFreeze}
+          onRemove={requestDeleteColumnByKey}
+          onReorder={handleReorderFields}
+        />
+      )}
+
+      {showDetailFieldConfig && (
+        <DetailFieldConfigModal
+          fields={fields}
+          selectedKeys={configuredDetailKeys ?? detailVisibleFields.map(field => field.key)}
+          onClose={() => setShowDetailFieldConfig(false)}
+          onSave={saveDetailFieldKeys}
+        />
+      )}
+
+      {showQuickSelect && (
+        <Modal title="按序号范围勾选" onClose={() => setShowQuickSelect(false)} width={420}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#475569' }}>
+              当前筛选结果序号
+              <input className="form-input" value={quickSelectRange} onChange={event => setQuickSelectRange(event.target.value)} placeholder="1-10, 15, 20-25" autoFocus />
+            </label>
+            <div style={{ color: '#64748b', fontSize: 12 }}>可输入单个序号或多个范围；新范围会加入当前已勾选记录。</div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button className="btn btn-secondary" onClick={() => setShowQuickSelect(false)}>取消</button>
+              <button className="btn btn-primary" onClick={() => void handleQuickSelectRange()} disabled={quickSelectLoading}>
+                {quickSelectLoading ? '读取记录...' : '勾选范围'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {showBulkEdit && (
+        <Modal title={`批量编辑 ${selectedIds.length} 条专利`} onClose={() => setShowBulkEdit(false)} width={520}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <p style={{ fontSize: 12, color: '#9ca3af', margin: 0 }}>
+              只填写需要修改的字段，留空的字段保持不变。
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#6b7280', marginBottom: 4 }}>关联模块</label>
+                <input className="form-input" value={bulkModule} onChange={e => setBulkModule(e.target.value)} placeholder="如：摄像头模块" />
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#6b7280', marginBottom: 4 }}>风险等级</label>
+                <select className="form-input" value={bulkRiskLevel} onChange={e => setBulkRiskLevel(e.target.value)}>
+                  <option value="">不修改</option>
+                  <option value="none">无风险</option>
+                  <option value="low">低风险</option>
+                  <option value="medium">中风险</option>
+                  <option value="high">高风险</option>
+                  <option value="critical">严重风险</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#6b7280', marginBottom: 4 }}>法律状态</label>
+                <select className="form-input" value={bulkLegalStatus} onChange={e => setBulkLegalStatus(e.target.value)}>
+                  <option value="">不修改</option>
+                  <option value="unknown">未知</option>
+                  <option value="pending">审查中</option>
+                  <option value="granted">已授权</option>
+                  <option value="rejected">驳回</option>
+                  <option value="withdrawn">撤回</option>
+                  <option value="expired">失效</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#6b7280', marginBottom: 4 }}>国家/地区</label>
+                <select className="form-input" value={bulkCountry} onChange={e => setBulkCountry(e.target.value)}>
+                  <option value="">不修改</option>
+                  <option value="CN">中国 (CN)</option>
+                  <option value="US">美国 (US)</option>
+                  <option value="EP">欧洲 (EP)</option>
+                  <option value="JP">日本 (JP)</option>
+                  <option value="KR">韩国 (KR)</option>
+                  <option value="DE">德国 (DE)</option>
+                  <option value="GB">英国 (GB)</option>
+                  <option value="WO">PCT (WO)</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#6b7280', marginBottom: 4 }}>产品品类</label>
+                <input className="form-input" list="patent-product-categories" value={bulkCategory} onChange={e => setBulkCategory(e.target.value)} placeholder="选择或输入产品品类" />
+                <datalist id="patent-product-categories">{Array.from(new Set(products.flatMap(product => [product.name, product.category]).filter(Boolean))).map(category => <option key={category} value={category} />)}</datalist>
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#6b7280', marginBottom: 4 }}>申请人</label>
+                <input className="form-input" value={bulkApplicant} onChange={e => setBulkApplicant(e.target.value)} placeholder="如：某科技公司" />
+              </div>
+            </div>
+            <details style={{ borderTop: '1px solid #e5e7eb', paddingTop: 10 }}>
+              <summary style={{ cursor: 'pointer', fontSize: 12, color: '#475569', fontWeight: 600 }}>选择其他字段批量赋值</summary>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                <select
+                  className="form-input"
+                  value={bulkFieldKey}
+                  onChange={e => { setBulkFieldKey(e.target.value); setBulkFieldValue('') }}
+                >
+                  <option value="">不追加其他字段</option>
+                  {fields.filter(field => field.editable && !['has_risk', 'risk_level', 'risk_description', 'family_members', 'cited_patents', 'citing_patents', 'projects'].includes(field.key)).map(field => (
+                    <option key={field.key} value={field.key}>{field.name}</option>
+                  ))}
+                </select>
+                {(() => {
+                  const selectedField = fields.find(field => field.key === bulkFieldKey)
+                  if (selectedField?.field_type === 'select' && selectedField.options) {
+                    return <select className="form-input" value={bulkFieldValue} onChange={e => setBulkFieldValue(e.target.value)}><option value="">请选择值</option>{selectedField.options.map(option => <option key={option} value={option}>{option}</option>)}</select>
+                  }
+                  if (selectedField?.field_type === 'boolean') {
+                    return <select className="form-input" value={bulkFieldValue} onChange={e => setBulkFieldValue(e.target.value)}><option value="">请选择值</option><option value="true">是</option><option value="false">否</option></select>
+                  }
+                  return <input className="form-input" value={bulkFieldValue} onChange={e => setBulkFieldValue(e.target.value)} placeholder="批量写入相同值" disabled={!bulkFieldKey} />
+                })()}
+              </div>
+              <div style={{ marginTop: 4, fontSize: 11, color: '#94a3b8' }}>空值不参与批量更新；风险正式结论和关系原始列不能在这里修改。</div>
+            </details>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 8 }}>
+              <button className="btn btn-secondary" onClick={() => setShowBulkEdit(false)}>取消</button>
+              <button className="btn btn-primary" onClick={handleBulkEditSave}>保存</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {bulkTransferAction && (
+        <Modal
+          title={bulkTransferAction === 'move_database' ? `移库 ${selectedIds.length} 条专利` : bulkTransferAction === 'move_view' ? `移动到视图 ${selectedIds.length} 条专利` : `复制 ${selectedIds.length} 条工作副本`}
+          onClose={() => setBulkTransferAction(null)}
+          width={520}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ padding: '10px 12px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 6, fontSize: 12, color: '#475569', lineHeight: 1.6 }}>
+              {bulkTransferAction === 'duplicate'
+                ? '复制会生成可继续加工的工作副本，副本清空申请号、公开号和授权号，并保留来源专利 ID。'
+                : '整批操作会先校验全部记录和目标，校验失败时旧数据不改变。'}
+            </div>
+            {(bulkTransferAction === 'move_database' || bulkTransferAction === 'duplicate') && (
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#64748b', marginBottom: 4 }}>目标数据库</label>
+                <select className="form-input" value={bulkTargetDatabaseId ?? ''} onChange={e => setBulkTargetDatabaseId(e.target.value ? Number(e.target.value) : null)}>
+                  <option value="">请选择数据库</option>
+                  {databases.filter(database => !database.is_archived).map(database => (
+                    <option key={database.id} value={database.id}>{database.name}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {bulkTransferAction === 'move_view' && (
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#64748b', marginBottom: 4 }}>目标视图</label>
+                <select className="form-input" value={bulkTargetViewId ?? ''} onChange={e => setBulkTargetViewId(e.target.value ? Number(e.target.value) : null)}>
+                  <option value="">库主表（清除显式视图）</option>
+                  {views.filter(view => view.database_id === activeDatabaseId && !view.is_archived && view.layout_type === 'table').map(view => (
+                    <option key={view.id} value={view.id}>{view.name}</option>
+                  ))}
+                </select>
+                <div style={{ marginTop: 4, fontSize: 11, color: '#94a3b8' }}>只能移动到当前数据库的表格视图。</div>
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => setBulkTransferAction(null)}>取消</button>
+              <button className="btn btn-primary" onClick={handleBulkTransfer}>
+                {bulkTransferAction === 'duplicate' ? '创建工作副本' : '执行批量操作'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {showBulkTag && (
+        <Modal title={`批量打标签 ${selectedIds.length} 条专利`} onClose={() => setShowBulkTag(false)} width={480}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#6b7280', marginBottom: 4 }}>操作模式</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {(['add', 'replace', 'remove'] as const).map(m => (
+                  <button
+                    key={m}
+                    className={`btn ${bulkTagMode === m ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ fontSize: 12, padding: '4px 12px' }}
+                    onClick={() => setBulkTagMode(m)}
+                  >
+                    {m === 'add' ? '追加标签' : m === 'replace' ? '替换全部' : '移除标签'}
+                  </button>
+                ))}
+              </div>
+              <p style={{ fontSize: 11, color: '#9ca3af', margin: '4px 0 0' }}>
+                {bulkTagMode === 'add' && '把选中的标签追加到每条专利（保留原有标签）'}
+                {bulkTagMode === 'replace' && '用选中的标签替换每条专利的全部标签'}
+                {bulkTagMode === 'remove' && '从每条专利中移除选中的标签'}
+              </p>
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#6b7280', marginBottom: 4 }}>快速使用产品品类作为标签</label>
+              <select className="form-input" value={bulkCategoryTag} onChange={event => setBulkCategoryTag(event.target.value)}>
+                <option value="">不添加产品品类标签</option>
+                {Array.from(new Set(products.flatMap(product => [product.name, product.category]).filter(Boolean))).map(category => <option key={category} value={category}>{category}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#6b7280', marginBottom: 4 }}>
+                选择标签 {bulkTagLoading && '（加载中...）'}
+              </label>
+              {tagsList.length === 0 && !bulkTagLoading ? (
+                <p style={{ fontSize: 12, color: '#9ca3af' }}>
+                  暂无标签。请先在「管理」页面创建标签。
+                </p>
+              ) : (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 240, overflowY: 'auto', padding: 4, border: '1px solid #e5e7eb', borderRadius: 6 }}>
+                  {tagsList.map(t => {
+                    const selected = bulkTagIds.includes(t.id)
+                    return (
+                      <button
+                        key={t.id}
+                        onClick={() => toggleBulkTagId(t.id)}
+                        style={{
+                          fontSize: 12, padding: '4px 10px', cursor: 'pointer',
+                          border: selected ? '1px solid #3b82f6' : '1px solid #d1d5db',
+                          borderRadius: 14, background: selected ? '#eff6ff' : '#fff',
+                          color: selected ? '#1d4ed8' : '#374151',
+                        }}
+                      >
+                        {t.color && (
+                          <span style={{
+                            display: 'inline-block', width: 8, height: 8, borderRadius: '50%',
+                            background: t.color, marginRight: 4, verticalAlign: 'middle',
+                          }} />
+                        )}
+                        {t.name}
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+            {bulkTagIds.length > 0 && (
+              <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>
+                已选 {bulkTagIds.length} 个标签
+              </p>
+            )}
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => setShowBulkTag(false)}>取消</button>
+              <button className="btn btn-primary" onClick={handleBulkTagSave} disabled={bulkTagIds.length === 0 && !bulkCategoryTag}>
+                确认
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {showQuickAnalyze && (
+        <AIQuickAnalyzeModal
+          patentIds={quickAnalyzePatentIds}
+          fields={fields}
+          customFields={customFields}
+          initialInputFields={quickAnalyzeInputFields}
+          onClose={() => setShowQuickAnalyze(false)}
+          onStarted={handleQuickAnalyzeStarted}
+        />
+      )}
+      {showJEVAnalyze && <JEVQuickAnalyzeModal patents={patents.filter(patent => jevAnalyzePatentIds.includes(patent.id))} onClose={() => setShowJEVAnalyze(false)} />}
+
+      {showClearDatabase && (
+        <div className="modal-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget && !clearingDatabase) setShowClearDatabase(false) }}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="clear-db-title">
+            <div className="modal-header">
+              <h2 id="clear-db-title">清空当前库专利</h2>
+              <button type="button" className="modal-close" onClick={() => setShowClearDatabase(false)} disabled={clearingDatabase} aria-label="关闭">×</button>
+            </div>
+            <div className="modal-body">
+              <p>确定清空「{databases.find(d => d.id === activeDatabaseId)?.name || '当前库'}」内的全部专利吗？</p>
+              <p className="text-muted">库内 {databases.find(d => d.id === activeDatabaseId)?.patent_count ?? 0} 条专利及其关联数据将被删除，库本身会保留。此操作不可恢复。</p>
+            </div>
+            <div className="modal-footer">
+              <button type="button" className="btn-secondary" onClick={() => setShowClearDatabase(false)} disabled={clearingDatabase}>取消</button>
+              <button type="button" className="btn-danger" onClick={() => void handleClearDatabase()} disabled={clearingDatabase}>
+                {clearingDatabase ? '清空中...' : '确认清空'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {urlImagePreview && (
+        <ImageLightbox
+          images={[urlImagePreview]}
+          index={0}
+          onClose={() => setUrlImagePreview(null)}
+          onIndexChange={() => { /* 单图预览无需切换 */ }}
+        />
+      )}
+
+      {showSyncUpdate && (
+        <Modal
+          title={syncUpdateBatch ? `外部更新预览 · ${syncUpdatePatentIds.length} 条` : `选择外部数据源 · ${syncUpdatePatentIds.length} 条`}
+          width={760}
+          onClose={() => { if (!syncUpdateLoading) void cancelSyncUpdate() }}
+        >
+          {syncUpdateLoading && !syncUpdateBatch ? (
+            <div style={{ padding: 36, textAlign: 'center', color: '#64748b' }}>加载连接器中...</div>
+          ) : !syncUpdateBatch ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div style={{ padding: '10px 12px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6, color: '#166534', fontSize: 12, lineHeight: 1.6 }}>
+                先从外部数据源读取并生成差异预览。此步骤不会修改本地专利，也不会新增专利；确认后才会覆盖你勾选的字段。
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#475569', marginBottom: 5 }}>数据源</label>
+                {syncUpdateConnectors.length === 0 ? (
+                  <div style={{ padding: 10, border: '1px solid #fecaca', background: '#fef2f2', color: '#b91c1c', borderRadius: 6, fontSize: 12 }}>
+                    没有可用的外部连接器，请先在设置中配置并启用连接器。
+                  </div>
+                ) : (
+                  <select className="form-input" value={syncUpdateConnectorId ?? ''} onChange={event => {
+                    const connectorId = Number(event.target.value) || null
+                    setSyncUpdateConnectorId(connectorId)
+                    const connector = syncUpdateConnectors.find(item => item.id === connectorId)
+                    const supported = connector?.provider_type === 'himmpat_mcp'
+                      ? ['publication_number', 'application_number', 'title', 'abstract', 'applicant', 'assignee', 'inventor', 'filing_date', 'publication_date', 'country', 'ipc_all', ...(connector.capabilities.legal_events === true ? ['legal_status', 'grant_date'] : [])]
+                      : ['publication_number', 'application_number', 'grant_number', 'title', 'abstract', 'applicant', 'assignee', 'inventor', 'agent', 'filing_date', 'publication_date', 'grant_date', 'country', 'ipc_main', 'ipc_all', 'cpc_main', 'priority_number', 'priority_date', 'legal_status']
+                    setSyncUpdateRequestedFields(supported.filter(key => fields.some(field => field.key === key)))
+                  }}>
+                    {syncUpdateConnectors.map(connector => <option key={connector.id} value={connector.id}>{connector.name} · {connector.provider_type}</option>)}
+                  </select>
+                )}
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#475569', marginBottom: 5 }}>本次读取并可更新的字段</label>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '7px 12px', padding: 10, border: '1px solid #e2e8f0', borderRadius: 6, maxHeight: 150, overflowY: 'auto' }}>
+                  {syncUpdateSupportedFields.map(field => <label key={field.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: '#475569', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={syncUpdateRequestedFields.includes(field.key)} onChange={() => toggleSyncUpdateRequestedField(field.key)} />{field.name}
+                  </label>)}
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                <button className="btn btn-secondary" onClick={() => void cancelSyncUpdate()}>取消</button>
+                <button className="btn btn-primary" onClick={() => void previewSyncUpdate()} disabled={!syncUpdateConnectorId || syncUpdateConnectors.length === 0 || syncUpdateRequestedFields.length === 0}>生成预览</button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '9px 11px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 6, fontSize: 12, color: '#475569' }}>
+                <span>预览有效期至 {syncUpdateBatch.expires_at ? new Date(syncUpdateBatch.expires_at).toLocaleString() : '-'}</span>
+                <span>可确认 {syncUpdateBatch.items.filter(item => item.status === 'ready').length} 条</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: '55vh', overflowY: 'auto' }}>
+                {syncUpdateBatch.items.map(item => {
+                  const patent = patents.find(row => row.id === item.patent_id)
+                  const canUpdate = item.status === 'ready' || item.status === 'no_change'
+                  const selected = syncUpdateFields[item.id] || []
+                  return (
+                    <div key={item.id} style={{ border: `1px solid ${canUpdate ? '#e2e8f0' : '#fecaca'}`, borderRadius: 6, padding: '10px 12px', background: canUpdate ? '#fff' : '#fff7f7' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: canUpdate && item.changed_fields.length > 0 ? 8 : 0 }}>
+                        <strong style={{ fontSize: 12, color: '#334155' }}>{patent?.title || `专利 ${item.patent_id ?? '-'}`}</strong>
+                        <span style={{ fontSize: 11, color: canUpdate ? '#15803d' : '#b91c1c' }}>
+                          {item.status === 'ready' ? '有可覆盖变化' : item.status === 'no_change' ? '无字段变化' : item.error_message || '无法匹配外部记录'}
+                        </span>
+                      </div>
+                      {canUpdate && item.changed_fields.length > 0 && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                          {item.changed_fields.map(fieldKey => {
+                            const checked = selected.includes(fieldKey)
+                            const field = fields.find(candidate => candidate.key === fieldKey)
+                            return (
+                              <label key={fieldKey} style={{ display: 'grid', gridTemplateColumns: '18px 110px minmax(0, 1fr)', gap: 6, alignItems: 'start', fontSize: 12, cursor: 'pointer' }}>
+                                <input type="checkbox" checked={checked} onChange={() => toggleSyncUpdateField(item.id, fieldKey)} />
+                                <span style={{ color: '#475569', fontWeight: 600 }}>{field?.name || fieldKey}</span>
+                                <span style={{ minWidth: 0, color: '#64748b', lineHeight: 1.45, wordBreak: 'break-word' }}>
+                                  <span style={{ color: '#94a3b8' }}>旧值：</span>{String(item.current_fields[fieldKey] ?? '-')}
+                                  <br />
+                                  <span style={{ color: '#15803d' }}>新值：</span>{String(item.candidate_fields[fieldKey] ?? '-')}
+                                </span>
+                              </label>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 4 }}>
+                <button className="btn btn-secondary" onClick={() => void cancelSyncUpdate()} disabled={syncUpdateLoading}>取消</button>
+                <button className="btn btn-primary" onClick={() => void confirmSyncUpdate()} disabled={syncUpdateLoading}>
+                  确认覆盖 {Object.values(syncUpdateFields).filter(values => values.length > 0).length} 条
+                </button>
+              </div>
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {showInsertAIColumn && (
+        <Modal
+          title="插入新列"
+          width={680}
+          onClose={() => {
+            setShowInsertAIColumn(false)
+            setNewAIColumnName('')
+            setNewColumnOptions('')
+            setInsertColType('text')
+            setInsertColFrozen(false)
+          }}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{
+              padding: '10px 12px',
+              background: '#eff6ff',
+              border: '1px solid #bfdbfe',
+              borderRadius: 6,
+              fontSize: 12,
+              color: '#1e40af',
+              lineHeight: 1.6,
+            }}>
+              新建普通字段用于人工补充、筛选和导出。AI 分析请统一从“AI 快速分析”进入，并在那里选择可复用模板、输入列和处理范围。
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#64748b', marginBottom: 4, fontWeight: 500 }}>
+                  新列名称 <span style={{ color: '#dc2626' }}>*</span>
+                </label>
+                <input
+                  className="form-input"
+                  value={newAIColumnName}
+                  onChange={e => setNewAIColumnName(e.target.value)}
+                  placeholder="例如：技术领域分类"
+                />
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#64748b', marginBottom: 4, fontWeight: 500 }}>
+                  列类型
+                </label>
+                <select
+                  className="form-input"
+                  value={insertColType}
+                  onChange={e => {
+                    const value = e.target.value
+                    if (['text', 'longtext', 'number', 'date', 'select', 'boolean', 'attachment'].includes(value)) {
+                      setInsertColType(value as typeof insertColType)
+                    }
+                  }}
+                >
+                  <option value="text">文本（手动填写）</option>
+                  <option value="longtext">长文本（手动填写）</option>
+                  <option value="number">数字</option>
+                  <option value="date">日期</option>
+                  <option value="select">单选（下拉）</option>
+                  <option value="boolean">是/否</option>
+                  <option value="attachment">附件</option>
+                </select>
+              </div>
+            </div>
+
+            {insertColType === 'select' && (
+              <div>
+                <label style={{ display: 'block', fontSize: 12, color: '#64748b', marginBottom: 4, fontWeight: 500 }}>
+                  候选项 <span style={{ color: '#dc2626' }}>*</span>（每行一个）
+                </label>
+                <textarea
+                  className="form-input"
+                  style={{ minHeight: 80, fontSize: 12 }}
+                  value={newColumnOptions}
+                  onChange={e => setNewColumnOptions(e.target.value)}
+                  placeholder={'例如：\n机械\n电子\n软件\n化学'}
+                />
+              </div>
+            )}
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: '#475569', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={insertColFrozen}
+                onChange={e => setInsertColFrozen(e.target.checked)}
+              />
+              冻结此列（始终显示在左侧）
+            </label>
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  setShowInsertAIColumn(false)
+                  setNewAIColumnName('')
+                  setNewColumnOptions('')
+                  setInsertColType('text')
+                  setInsertColFrozen(false)
+                }}
+              >
+                取消
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => void handleInsertAIColumn()}
+                disabled={creatingAIColumn}
+              >
+                {creatingAIColumn ? '创建中...' : '创建列'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {showColumnStats && (
+        <Modal
+          title={`列统计：${fields.find(f => f.key === statsFieldKey)?.name || statsFieldKey}`}
+          width={680}
+          onClose={() => {
+            setShowColumnStats(false)
+            setShowStatsToTags(false)
+          }}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {statsLoading ? (
+              <div style={{ textAlign: 'center', padding: 40, color: '#64748b' }}>
+                <div className="spinner" style={{ width: 32, height: 32, margin: '0 auto 12px', borderWidth: 3 }}></div>
+                统计中...
+              </div>
+            ) : statsData.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8' }}>无数据</div>
+            ) : (
+              <>
+                <div style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  padding: '8px 12px', background: '#f0f9ff', borderRadius: 6, fontSize: 12, color: '#0369a1',
+                }}>
+                  <span>共 {statsData.length} 个去重值</span>
+                  <button
+                    className="btn btn-sm btn-primary"
+                    style={{ fontSize: 12, padding: '4px 10px' }}
+                    onClick={() => setShowStatsToTags(true)}
+                  >
+                    <Icon name="tag" /> 转为分类标签
+                  </button>
+                </div>
+
+                {showStatsToTags && (
+                  <div style={{
+                    background: '#fefce8', border: '1px solid #fde68a', borderRadius: 6, padding: 12,
+                  }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>把统计结果转为标签体系</div>
+                    <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+                      <input
+                        className="form-input"
+                        style={{ flex: 1, fontSize: 12 }}
+                        value={tagGroupName}
+                        onChange={e => setTagGroupName(e.target.value)}
+                        placeholder="标签组名称"
+                      />
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#475569', whiteSpace: 'nowrap' }}>
+                        <input type="checkbox" checked={autoApplyTags} onChange={e => setAutoApplyTags(e.target.checked)} />
+                        自动给原专利打标
+                      </label>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button className="btn btn-primary" style={{ fontSize: 12, padding: '4px 12px' }} onClick={handleStatsToTags} disabled={convertingTags}>
+                        {convertingTags ? '转换中...' : '确认转换'}
+                      </button>
+                      <button className="btn btn-secondary" style={{ fontSize: 12, padding: '4px 12px' }} onClick={() => setShowStatsToTags(false)}>
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ maxHeight: 400, overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: 6 }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                    <thead style={{ position: 'sticky', top: 0, background: '#f8fafc', zIndex: 1 }}>
+                      <tr>
+                        <th style={{ padding: '8px 10px', textAlign: 'left', fontWeight: 600, borderBottom: '1px solid #e2e8f0' }}>值</th>
+                        <th style={{ padding: '8px 10px', textAlign: 'right', fontWeight: 600, width: 80, borderBottom: '1px solid #e2e8f0' }}>计数</th>
+                        <th style={{ padding: '8px 10px', textAlign: 'right', fontWeight: 600, width: 80, borderBottom: '1px solid #e2e8f0' }}>占比</th>
+                        <th style={{ padding: '8px 10px', textAlign: 'left', fontWeight: 600, width: 120, borderBottom: '1px solid #e2e8f0' }}>分布</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {statsData.map((item, i) => (
+                        <tr key={i} style={{ borderTop: '1px solid #f1f5f9' }}>
+                          <td style={{ padding: '6px 10px', wordBreak: 'break-word' }}>{item.value}</td>
+                          <td style={{ padding: '6px 10px', textAlign: 'right', fontFamily: 'monospace' }}>{item.count}</td>
+                          <td style={{ padding: '6px 10px', textAlign: 'right', color: '#64748b' }}>{item.percentage}%</td>
+                          <td style={{ padding: '6px 10px' }}>
+                            <div style={{
+                              height: 8, background: '#e2e8f0', borderRadius: 4, overflow: 'hidden',
+                            }}>
+                              <div style={{
+                                height: '100%',
+                                width: `${item.percentage}%`,
+                                background: 'linear-gradient(90deg, #3b82f6, #60a5fa)',
+                                borderRadius: 4,
+                              }}></div>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </div>
+        </Modal>
+      )}
+
+      {showPatentAnalysis && (
+        <Modal title="专利统计与分析" onClose={() => setShowPatentAnalysis(false)} width={1180}>
+          <div className="patent-analysis-dialog-content">
+            <div className="analysis-scope-switcher" role="tablist" aria-label="分析范围">
+              <button className={analysisScope === 'view' ? 'active' : ''} onClick={() => setAnalysisScope('view')}>当前视图</button>
+              <button className={analysisScope === 'selected' ? 'active' : ''} onClick={() => setAnalysisScope('selected')} disabled={selectedIds.length === 0}>已勾选 ({selectedIds.length})</button>
+              <button className={analysisScope === 'all' ? 'active' : ''} onClick={() => setAnalysisScope('all')}>整个库</button>
+            </div>
+            <StatsPage
+              patentIds={analysisScope === 'selected' ? selectedIds : analysisScope === 'view' ? patents.map(item => item.id) : undefined}
+              scopeLabel={analysisScope === 'selected' ? `当前勾选的 ${selectedIds.length} 件专利` : analysisScope === 'view' ? '当前视图已加载数据范围' : '当前数据库全部数据'}
+            />
+          </div>
+        </Modal>
+      )}
+
+      {/* 右键上下文菜单 */}
+      {contextMenu && (
+        <div
+          className="context-menu"
+          style={{
+            position: 'fixed',
+            left: Math.max(8, Math.min(contextMenu.x, window.innerWidth - 300)),
+            top: Math.max(8, Math.min(contextMenu.y, window.innerHeight - (contextMenu.type === 'header' ? 760 : 260))),
+            zIndex: 1100,
+            background: '#fff',
+            border: '1px solid #e5e7eb',
+            borderRadius: 8,
+            boxShadow: '0 10px 25px rgba(0,0,0,0.15)',
+            minWidth: contextMenu.type === 'header' ? 280 : 200,
+            maxHeight: 'calc(100vh - 16px)',
+            overflowY: 'auto',
+            padding: '4px 0',
+            fontSize: 12,
+          }}
+          onClick={() => setContextMenu(null)}
+        >
+          {contextMenu.type === 'row' && (() => {
+            const patent = patents.find(p => p.id === contextMenu.patentId)
+            const fieldName = contextMenu.fieldKey ? fields.find(f => f.key === contextMenu.fieldKey)?.name : null
+            return (
+              <>
+                {/* 行操作 */}
+                {patent && (
+                  <>
+                    <div className="menu-heading">
+                      {patent.title?.slice(0, 30) || `#${patent.id}`}
+                    </div>
+                    <div className="menu-item" onClick={openContextPatent}>
+                      <Icon name="file" /> 查看详情
+                    </div>
+                    {fieldName && (
+                      <div className="menu-item" onClick={() => handleCopyCell(contextMenu.patentId!, contextMenu.fieldKey!)}>
+                        <Icon name="copy" /> 复制"{fieldName}"的值
+                      </div>
+                    )}
+                    {contextMenu.fieldKey && (
+                      <div className="menu-item menu-item-ai" onClick={() => handleCellQuickAI(contextMenu.patentId!, contextMenu.fieldKey!)}>
+                        <Icon name="sparkles" /> 用此单元格作为 AI 输入
+                      </div>
+                    )}
+                    <div className="menu-divider" />
+                    <div className="menu-item" style={{ color: '#dc2626' }} onClick={() => handleDeletePatent(contextMenu.patentId!)}>
+                      <Icon name="trash" /> 删除此行
+                    </div>
+                  </>
+                )}
+              </>
+            )
+          })()}
+          {contextMenu.type === 'header' && (() => {
+            const field = fields.find(f => f.key === contextMenu.fieldKey)
+            if (!field) return null
+            const isFrozen = frozenFields.has(field.key)
+            return (
+              <>
+                <div className="menu-heading">
+                  列：{field.name}
+                  <span style={{ marginLeft: 6, fontSize: 10, padding: '1px 4px', background: '#eff6ff', color: '#1e40af', borderRadius: 2 }}>
+                    {field.field_type}
+                  </span>
+                </div>
+                <div className="menu-item" onClick={() => void handleCopyColumn(field.key)} title={`复制当前筛选结果中的 ${totalPatents} 个单元格值，使用制表符换行格式`}>
+                  <Icon name="copy" /> 复制整列值（{totalPatents} 行）
+                </div>
+                <div className="menu-divider" />
+                <div className="menu-heading">已勾选 {selectedIds.length} 条 · 批量操作</div>
+                <div className="menu-item menu-item-ai" onClick={() => { setQuickAnalyzePatentIds(selectedIds); setShowQuickAnalyze(true) }} style={{ opacity: selectedIds.length ? 1 : 0.5, pointerEvents: selectedIds.length ? 'auto' : 'none' }}>
+                  <Icon name="sparkles" /> AI 快速分析
+                </div>
+                {selectedIds.length === 1 && <div className="menu-item menu-item-ai" onClick={() => { setJevAnalyzePatentIds(selectedIds); setShowJEVAnalyze(true) }}><Icon name="sparkles" /> JEV 标引</div>}
+                <div className="menu-item" onClick={() => setShowBulkEdit(true)} style={{ opacity: selectedIds.length ? 1 : 0.5, pointerEvents: selectedIds.length ? 'auto' : 'none' }}><Icon name="edit" /> 批量编辑</div>
+                <div className="menu-item" onClick={() => setShowBulkTag(true)} style={{ opacity: selectedIds.length ? 1 : 0.5, pointerEvents: selectedIds.length ? 'auto' : 'none' }}><Icon name="tag" /> 批量打标签</div>
+                {!isGlobalMasterTable && <div className="menu-item" onClick={() => void openSyncUpdate(selectedIds)} style={{ opacity: selectedIds.length ? 1 : 0.5, pointerEvents: selectedIds.length ? 'auto' : 'none' }}><Icon name="refresh" /> 外部更新</div>}
+                <div className="menu-item" onClick={() => openBulkTransfer('duplicate')} style={{ opacity: selectedIds.length ? 1 : 0.5, pointerEvents: selectedIds.length ? 'auto' : 'none' }}><Icon name="copy" /> 复制为工作副本</div>
+                {!isGlobalMasterTable && <>
+                  <div className="menu-item" onClick={() => openBulkTransfer('move_view')} style={{ opacity: selectedIds.length ? 1 : 0.5, pointerEvents: selectedIds.length ? 'auto' : 'none' }}><Icon name="move" /> 移动到视图</div>
+                  <div className="menu-item" onClick={() => openBulkTransfer('move_database')} style={{ opacity: selectedIds.length ? 1 : 0.5, pointerEvents: selectedIds.length ? 'auto' : 'none' }}><Icon name="database" /> 移库</div>
+                </>}
+                <div className="menu-item" onClick={() => void handleBulkRollbackBefore()} style={{ opacity: selectedIds.length ? 1 : 0.5, pointerEvents: selectedIds.length ? 'auto' : 'none' }}><Icon name="history" /> 批量回滚</div>
+                <div className="menu-item menu-item-danger" onClick={handleBulkDelete} style={{ opacity: selectedIds.length ? 1 : 0.5, pointerEvents: selectedIds.length ? 'auto' : 'none' }}><Icon name="trash" /> 批量删除</div>
+                <div className="menu-divider" />
+                <div className="menu-item" onClick={clearSelection}><Icon name="x" /> 取消勾选</div>
+                <div className="menu-item" onClick={() => { setActiveHeaderMenu(null); handleSort(field.key) }}>
+                  {sortField === field.key && sortOrder === 'asc' ? '↓ 降序排列' : '↑ 升序排列'}
+                </div>
+                <div className="menu-item" onClick={() => handleToggleFreeze(field.key)}>
+                  <Icon name={isFrozen ? 'unlock' : 'lock'} /> {isFrozen ? '取消冻结' : '冻结此列'}
+                </div>
+                <div className="menu-item" onClick={() => handleToggleFieldVisible(field.key)}>
+                  隐藏此列
+                </div>
+                <div className="menu-item" onClick={() => openColumnStats(field.key)}>
+                  <Icon name="chart" /> 统计此列
+                </div>
+                <div className="menu-divider" />
+                <div className="menu-item" style={{ color: '#2563eb' }} onClick={() => openInsertAIDialog('text', field.key, 'before')}>
+                  <Icon name="columns" /> 左侧插入新列
+                </div>
+                <div className="menu-item" style={{ color: '#2563eb' }} onClick={() => openInsertAIDialog('text', field.key, 'after')}>
+                  <Icon name="columns" /> 右侧插入新列
+                </div>
+                <div className="menu-divider" />
+                <div className="menu-item" style={{ color: '#dc2626' }} onClick={() => requestDeleteColumnByKey(field.key)}>
+                  <Icon name="trash" /> 从当前表格移除
+                </div>
+              </>
+            )
+          })()}
+        </div>
+      )}
+
+      {/* 表头勾选范围菜单 */}
+      {selectScopeMenu && (
+        <div
+          className="context-menu select-scope-menu"
+          style={{
+            position: 'fixed',
+            left: Math.max(8, Math.min(selectScopeMenu.x, window.innerWidth - 270)),
+            top: Math.max(8, Math.min(selectScopeMenu.y, window.innerHeight - 220)),
+            zIndex: 1100,
+            background: '#fff',
+            border: '1px solid #e5e7eb',
+            borderRadius: 8,
+            boxShadow: '0 10px 25px rgba(0,0,0,0.15)',
+            minWidth: 236,
+            padding: '4px 0',
+            fontSize: 12,
+          }}
+          onClick={event => event.stopPropagation()}
+        >
+          <div className="menu-heading">选择勾选范围 · 当前库共 {totalPatents} 条</div>
+          <div className={`menu-item${allSelected ? ' is-active' : ''}`} onClick={() => { selectCurrentPage(); setSelectScopeMenu(null) }}>
+            <Icon name="check" /> 勾选当前页（{patents.length} 条）
+          </div>
+          <div
+            className={`menu-item${allLibrarySelected ? ' is-active' : ''}`}
+            style={{ opacity: scopeSelecting ? 0.6 : 1, pointerEvents: scopeSelecting ? 'none' : 'auto' }}
+            onClick={() => { void selectAllInScope(); setSelectScopeMenu(null) }}
+          >
+            <Icon name="database" /> {scopeSelecting ? '读取中…' : `勾选当前库全部（${totalPatents} 条）`}
+          </div>
+          <div className="menu-item" onClick={() => { setShowQuickSelect(true); setSelectScopeMenu(null) }}>
+            <Icon name="filter" /> 按序号范围勾选…
+          </div>
+          <div className="menu-divider" />
+          <div className="menu-item" onClick={() => { clearSelection(); setSelectScopeMenu(null) }}>
+            <Icon name="x" /> 取消勾选
+          </div>
+        </div>
+      )}
+
+      {/* AI 任务透明化浮动面板 */}
+      {(activeAITasks.length > 0 || recentCompleted) && (
+        <div style={{
+          position: 'fixed', right: 20, bottom: 20, zIndex: 1000,
+          width: aiPanelOpen ? 480 : 'auto',
+          maxWidth: 'calc(100vw - 40px)',
+          background: '#fff',
+          border: '1px solid #e5e7eb',
+          borderRadius: 8,
+          boxShadow: '0 10px 25px rgba(0,0,0,0.15)',
+          fontSize: 12,
+          overflow: 'hidden',
+        }}>
+          {/* 头部 */}
+          <div
+            style={{
+              padding: '8px 12px',
+              background: activeAITasks.length > 0 ? '#1e40af' : '#10b981',
+              color: '#fff',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              cursor: 'pointer',
+              userSelect: 'none',
+            }}
+            onClick={() => setAiPanelOpen(!aiPanelOpen)}
+          >
+            <span style={{ fontWeight: 600 }}>
+              {activeAITasks.length > 0
+                ? <><Icon name="sparkles" size={14} /> AI 任务运行中 ({activeAITasks.length})</>
+                : <><Icon name="check" size={14} /> AI 任务已完成</>}
+            </span>
+            <Icon name={aiPanelOpen ? 'chevron-down' : 'chevron-up'} size={14} />
+          </div>
+          {aiPanelOpen && (
+            <div style={{ maxHeight: 420, overflowY: 'auto' }}>
+              {/* 运行中任务 */}
+              {activeAITasks.map(task => {
+                const meta = taskMeta[task.id]
+                const progress = task.total_items > 0 ? (task.processed_items / task.total_items) * 100 : 0
+                return (
+                  <div key={task.id} style={{ padding: 12, borderBottom: '1px solid #f3f4f6' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <strong style={{ color: '#1f2937', fontSize: 13 }}>
+                        {meta?.fieldName || task.field_key}
+                      </strong>
+                      <span style={{ color: '#6b7280', fontSize: 11 }}>
+                        #{task.id} · <span style={{ color: '#3b82f6', fontWeight: 500 }}>{task.status}</span>
+                      </span>
+                    </div>
+                    {/* 进度条 */}
+                    <div style={{ background: '#f3f4f6', borderRadius: 3, height: 6, marginBottom: 6, overflow: 'hidden' }}>
+                      <div style={{
+                        width: `${progress}%`,
+                        height: '100%',
+                        background: 'linear-gradient(90deg, #3b82f6, #60a5fa)',
+                        borderRadius: 3,
+                        transition: 'width 0.3s',
+                      }} />
+                    </div>
+                    <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 8 }}>
+                      进度：{task.processed_items} / {task.total_items}
+                      （成功 {task.success_count}，失败 {task.failed_count}）
+                    </div>
+                    {meta && (
+                      <>
+                        <div style={{ marginBottom: 4, lineHeight: 1.5 }}>
+                          <span style={{ color: '#374151', fontWeight: 500 }}>纳入的列：</span>
+                          {meta.referencedColumns.length > 0 ? (
+                            <span style={{ color: '#1e40af' }}>
+                              {meta.referencedColumns.join('、')}
+                            </span>
+                          ) : (
+                            <span style={{ color: '#9ca3af', fontStyle: 'italic' }}>
+                              默认（标题、摘要、申请人、发明人）
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ marginBottom: 4, lineHeight: 1.5 }}>
+                          <span style={{ color: '#374151', fontWeight: 500 }}>输出位置：</span>
+                          <code style={{ background: '#f3f4f6', padding: '1px 4px', borderRadius: 2, fontSize: 11, color: '#7c3aed' }}>
+                            {meta.outputLocation}
+                          </code>
+                        </div>
+                        {meta.prompt && (
+                          <details style={{ marginTop: 4 }}>
+                            <summary style={{ cursor: 'pointer', color: '#6b7280', fontSize: 11 }}>查看 Prompt</summary>
+                            <pre style={{
+                              background: '#f9fafb',
+                              padding: 8,
+                              borderRadius: 3,
+                              fontSize: 11,
+                              maxHeight: 100,
+                              overflow: 'auto',
+                              whiteSpace: 'pre-wrap',
+                              margin: '4px 0 0',
+                              border: '1px solid #e5e7eb',
+                            }}>
+                              {meta.prompt}
+                            </pre>
+                          </details>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )
+              })}
+              {/* 最近完成的任务 */}
+              {recentCompleted && (
+                <div style={{
+                  padding: 12,
+                  background: '#ecfdf5',
+                  borderBottom: '1px solid #d1fae5',
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <strong style={{ color: '#065f46', fontSize: 13 }}>
+                      <Icon name="check" size={14} /> {recentCompleted.meta?.fieldName || 'AI 字段'}
+                    </strong>
+                    <span style={{ color: '#047857', fontSize: 11 }}>
+                      #{recentCompleted.taskId} · 完成
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11, color: '#047857', marginBottom: 4 }}>
+                    {recentCompleted.task?.success_count || 0} 件成功 · {recentCompleted.task?.failed_count || 0} 件失败
+                  </div>
+                  <div style={{ fontSize: 11, color: '#065f46' }}>
+                    结果已回填到表格，下方列表已自动刷新。
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeView && showGroupConfig && (
+        <GroupConfigPanel
+          open
+          view={activeView}
+          fields={fields}
+          onClose={() => setShowGroupConfig(false)}
+          onSave={saveGroupConfig}
+        />
+      )}
+      {activeView && showConditionalConfig && (
+        <ConditionalFormatPanel
+          open
+          view={activeView}
+          fields={fields}
+          onClose={() => setShowConditionalConfig(false)}
+          onSave={saveConditionalFormatting}
+        />
+      )}
+      {showExportDialog && (
+        <ExportDialog
+          fields={fields}
+          databaseId={isGlobalMasterTable ? null : activeDatabaseId}
+          viewId={viewId}
+          selectedIds={selectedIds}
+          search={searchText}
+          filters={filterValues as unknown as JsonObject}
+          onClose={() => setShowExportDialog(false)}
+        />
+      )}
+      {showWorkFileDialog && (
+        <WorkFileDialog
+          databaseId={activeDatabaseId}
+          viewId={activeView && !activeView.is_department_master ? viewId : null}
+          fields={fields}
+          selectedIds={selectedIds}
+          search={searchText}
+          filters={filterValues as unknown as JsonObject}
+          onClose={() => setShowWorkFileDialog(false)}
+        />
+      )}
+      {showAddToView && (
+        <Modal title={`加入业务视图（${selectedIds.length} 条）`} onClose={() => setShowAddToView(false)} width={460}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <p style={{ margin: 0, color: '#64748b', fontSize: 12 }}>同一专利可以同时加入多个业务视图。加入后，导出模板会按该视图的固定字段投影生成工作文件。</p>
+            <select className="form-input" value={addToViewId ?? ''} onChange={event => setAddToViewId(event.target.value ? Number(event.target.value) : null)}>
+              <option value="">请选择业务视图</option>
+              {views.filter(view => view.database_id === activeDatabaseId && !view.is_archived && !view.is_department_master && view.layout_type === 'table').map(view => <option key={view.id} value={view.id}>{view.name}</option>)}
+            </select>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button className="btn btn-secondary" type="button" onClick={() => setShowAddToView(false)}>取消</button>
+              <button className="btn btn-primary" type="button" disabled={!addToViewId} onClick={() => void handleAddToView()}>加入并保留原视图</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      </div>
+    </div>
+  )
+}
+
+function DetailFieldConfigModal({ fields, selectedKeys, onClose, onSave }: {
+  fields: FieldMeta[]
+  selectedKeys: string[]
+  onClose: () => void
+  onSave: (keys: string[]) => void
+}) {
+  const [draft, setDraft] = useState(selectedKeys)
+  const [query, setQuery] = useState('')
+  const filtered = fields.filter(field => `${field.name} ${field.key}`.toLowerCase().includes(query.trim().toLowerCase()))
+  return <Modal title="详情字段" onClose={onClose} width={560}>
+    <div className="detail-field-config">
+      <input className="form-input" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索字段" aria-label="搜索详情字段" />
+      <div className="detail-field-config-summary">已选择 {draft.length} 个字段</div>
+      <div className="detail-field-config-list">
+        {filtered.map(field => <label key={field.key} className="detail-field-config-option">
+          <input type="checkbox" checked={draft.includes(field.key)} onChange={event => setDraft(current => event.target.checked ? [...current, field.key] : current.filter(key => key !== field.key))} />
+          <span>{field.name}</span>
+        </label>)}
+      </div>
+      <div className="detail-field-config-actions">
+        <button type="button" className="btn btn-secondary" onClick={onClose}>取消</button>
+        <button type="button" className="btn btn-primary" onClick={() => onSave(draft)}>保存</button>
+      </div>
+    </div>
+  </Modal>
+}
+
+function Modal({ title, children, onClose, width = 480 }: {
+  title: string
+  children: React.ReactNode
+  onClose: () => void
+  width?: number
+}) {
+  return (
+    <div
+      style={{
+        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+        background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        zIndex: 1000, padding: 20,
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          background: 'white', borderRadius: 8, padding: 20, width: '100%', maxWidth: width,
+          maxHeight: '90vh', overflowY: 'auto',
+          boxShadow: '0 20px 60px rgba(0,0,0,0.15)',
+        }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600, color: '#111827' }}>{title}</h3>
+          <button
+            onClick={onClose}
+            style={{
+              border: 'none', background: 'transparent', fontSize: 20, cursor: 'pointer',
+              color: '#9ca3af', padding: 4, lineHeight: 1,
+            }}
+          >
+            ×
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  )
+}

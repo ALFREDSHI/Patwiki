@@ -1,0 +1,149 @@
+import { useState } from 'react'
+import { exportApi } from '../../api'
+import type { FieldMeta, JsonObject, JsonValue } from '../../types'
+import { getErrorMessage } from '../../lib/errors'
+import { save as saveDesktopFile } from '@tauri-apps/plugin-dialog'
+import { writeFile as writeDesktopFile } from '@tauri-apps/plugin-fs'
+
+interface ExportDialogProps {
+  fields: FieldMeta[]
+  databaseId?: number | null
+  viewId?: number | null
+  selectedIds?: number[]
+  search?: string
+  filters?: JsonObject
+  onClose: () => void
+}
+
+type ExportFormat = 'excel' | 'csv'
+
+export default function ExportDialog({ fields, databaseId, viewId, selectedIds = [], search, filters, onClose }: ExportDialogProps) {
+  const [format, setFormat] = useState<ExportFormat>('excel')
+  const [scope, setScope] = useState<'selected' | 'view' | 'database'>(selectedIds.length > 0 ? 'selected' : viewId ? 'view' : 'database')
+  const [selectedKeys, setSelectedKeys] = useState<string[]>(() => fields.filter(field => field.visible !== false).map(field => field.key))
+  const [groupBy, setGroupBy] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
+
+  const toggleField = (key: string) => {
+    setSelectedKeys(current => current.includes(key) ? current.filter(item => item !== key) : [...current, key])
+  }
+
+  const download = async (blob: Blob, extension: string) => {
+    const filename = `patwiki_export_${new Date().toISOString().slice(0, 10)}.${extension}`
+    // In the packaged desktop app, open a native save dialog and write the
+    // bytes directly to the selected path. Browser builds keep the normal
+    // download behavior as a fallback.
+    if ('__TAURI_INTERNALS__' in window) {
+      const path = await saveDesktopFile({
+        defaultPath: filename,
+        filters: [{ name: extension === 'xlsx' ? 'Excel 工作簿' : 'CSV 文件', extensions: [extension] }],
+      })
+      if (path) await writeDesktopFile(path, new Uint8Array(await blob.arrayBuffer()))
+      return Boolean(path)
+    }
+    const url = window.URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = filename
+    anchor.style.display = 'none'
+    document.body.appendChild(anchor)
+    anchor.click()
+    window.setTimeout(() => {
+      window.URL.revokeObjectURL(url)
+      anchor.remove()
+    }, 2000)
+    return true
+  }
+
+  const handleExport = async () => {
+    if (selectedKeys.length === 0) {
+      setError('请至少选择一个字段')
+      return
+    }
+    setSaving(true)
+    setError('')
+    setSuccess('')
+    try {
+      const payload: JsonObject = {
+        database_id: databaseId ?? null,
+        view_id: scope === 'view' ? (viewId ?? null) : null,
+        patent_ids: scope === 'selected' ? selectedIds : null,
+        field_keys: selectedKeys,
+        filters: (filters || {}) as unknown as JsonValue,
+        search: search || null,
+        group_by: format === 'excel' && groupBy ? groupBy : null,
+      }
+      const blob = format === 'excel' ? await exportApi.excel(payload) : await exportApi.csv(payload)
+      const extension = format === 'excel' ? 'xlsx' : 'csv'
+      const saved = await download(blob, extension)
+      setSuccess(saved
+        ? ('__TAURI_INTERNALS__' in window ? '文件已保存到你选择的桌面位置。' : `已开始下载 patwiki_export_${new Date().toISOString().slice(0, 10)}.${extension}，请在浏览器下载列表查看。`)
+        : '已取消保存。')
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, '导出失败'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal modal-lg export-dialog" onClick={event => event.stopPropagation()}>
+        <div className="modal-header">
+          <h3>导出数据</h3>
+          <button type="button" className="modal-close" onClick={onClose} aria-label="关闭">×</button>
+        </div>
+        <div className="modal-body">
+        {error && <div className="work-file-error">{error}</div>}
+        {success && <div className="work-file-success">{success}</div>}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
+          <label className="form-label">格式
+            <select className="form-input" value={format} onChange={event => setFormat(event.target.value as ExportFormat)}>
+              <option value="excel">Excel (.xlsx)</option>
+              <option value="csv">CSV (.csv)</option>
+            </select>
+          </label>
+          <label className="form-label">范围
+            <select className="form-input" value={scope} onChange={event => setScope(event.target.value as 'selected' | 'view' | 'database')}>
+              <option value="selected" disabled={selectedIds.length === 0}>已选 {selectedIds.length} 条</option>
+              <option value="view" disabled={!viewId}>当前视图（含视图筛选）</option>
+              <option value="database">当前库</option>
+            </select>
+          </label>
+        </div>
+        {format === 'excel' && (
+          <label className="form-label" style={{ marginBottom: 16 }}>按字段拆分工作表
+            <select className="form-input" value={groupBy} onChange={event => setGroupBy(event.target.value)}>
+              <option value="">不拆分</option>
+              {fields.filter(field => selectedKeys.includes(field.key) && ['text', 'select', 'boolean', 'formula'].includes(field.field_type)).map(field => (
+                <option key={field.key} value={field.key}>{field.name}</option>
+              ))}
+            </select>
+          </label>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <strong style={{ fontSize: 13 }}>导出字段</strong>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button type="button" className="btn btn-xs btn-secondary" onClick={() => setSelectedKeys(fields.map(field => field.key))}>全选</button>
+            <button type="button" className="btn btn-xs btn-secondary" onClick={() => setSelectedKeys([])}>清空</button>
+          </div>
+        </div>
+        <div className="export-field-list" style={{ maxHeight: 300, overflowY: 'auto', display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 }}>
+          {fields.map(field => (
+            <label key={field.key} style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, color: '#475569' }}>
+              <input type="checkbox" checked={selectedKeys.includes(field.key)} onChange={() => toggleField(field.key)} />
+              <span title={field.key}>{field.name}</span>
+            </label>
+          ))}
+        </div>
+        </div>
+        <div className="modal-footer">
+          <button type="button" className="btn btn-secondary" onClick={onClose}>取消</button>
+          <button type="button" className="btn btn-primary" onClick={() => void handleExport()} disabled={saving}>{saving ? '导出中...' : '开始导出'}</button>
+        </div>
+      </div>
+    </div>
+  )
+}

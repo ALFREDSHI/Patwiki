@@ -1,0 +1,274 @@
+from app.database import SessionLocal, init_db
+from app.models import Department, ProductLine, TagGroup, CustomField, CustomFieldType, PatentDatabase, PatentExportTemplate, SemanticSearchProfile
+from app.services.view_service import ViewService
+from app.services.field_governance_service import seed_registry_baseline
+
+
+def _ensure_organization_structure(db):
+    patent = db.query(Department).filter(Department.code == "PATENT").first()
+    if not patent:
+        patent = Department(name="专利部门", code="PATENT", department_type="patent", description="专利检索、分析与保护")
+        db.add(patent)
+        db.flush()
+
+    research = db.query(Department).filter(Department.code == "R_AND_D").first()
+    if not research:
+        research = Department(name="研发部门", code="R_AND_D", department_type="r_and_d", description="产品研发与项目管理")
+        db.add(research)
+        db.flush()
+
+    groups = [("PATENT_SEARCH", "检索"), ("PATENT_ANALYSIS", "分析"), ("PATENT_PROTECTION", "保护")]
+    for code, name in groups:
+        if not db.query(Department).filter(Department.code == code).first():
+            db.add(Department(name=name, code=code, department_type="other", parent_id=patent.id))
+
+    for code in ("PRO", "DIY", "OPE", "FGA", "CI"):
+        if not db.query(ProductLine).filter(ProductLine.code == code).first():
+            db.add(ProductLine(name=code, code=code, department_id=research.id, description=f"{code} 研发产品线"))
+    db.commit()
+
+
+def init_default_data():
+    db = SessionLocal()
+    try:
+        # 31 张真实来源表和字段基线是治理平台的只读起点；导入时未知列
+        # 仍通过 FieldObservation 保留，不在这里自动创建 CustomField。
+        seed_registry_baseline(db)
+        if db.query(Department).count() == 0:
+            departments = [
+                Department(name="检索组", description="负责专利检索、数据收集、竞品监控"),
+                Department(name="分析组", description="负责专利分析、风险评估、技术主题梳理"),
+                Department(name="撰写组", description="负责专利申请撰写、答复审查意见"),
+            ]
+            db.add_all(departments)
+            db.flush()
+
+        _ensure_organization_structure(db)
+
+        # 默认数据库（库是顶层品类容器）
+        if db.query(PatentDatabase).count() == 0:
+            default_db = PatentDatabase(
+                name="专利主表",
+                code="DEFAULT",
+                description="未指定库的专利会归入此库",
+                color="#1890ff",
+                is_default=True,
+                sort_order=0,
+            )
+            db.add(default_db)
+            db.flush()
+        else:
+            default_db = db.query(PatentDatabase).filter(PatentDatabase.is_default == True).first()
+            if default_db and default_db.name in {"默认数据库", "默认库"}:
+                default_db.name = "专利主表"
+
+        # The default profile is usable immediately for exact/keyword fallback.
+        # An embedding provider is intentionally not created without a user-owned credential reference.
+        if not db.query(SemanticSearchProfile).filter(SemanticSearchProfile.name == "默认混合检索").first():
+            db.add(SemanticSearchProfile(name="默认混合检索", is_default=True, retrieval_mode="hybrid", vector_backend="zvec", chunk_strategy_version="claims-description-v1"))
+
+        for database in db.query(PatentDatabase).filter(PatentDatabase.is_archived == False).all():
+            views = ViewService.ensure_default_business_views(db, database.id)
+            view_by_key = {view.template_key: view for view in views if view.template_key}
+            export_templates = [
+                {
+                    "key": "risk_meeting_excel",
+                    "name": "风险会风险统计表 · Excel",
+                    "format": "excel",
+                    "view_key": "risk_meeting_statistics",
+                    "fields": ["application_number", "publication_number", "title", "country", "risk_level", "risk_description", "legal_status"],
+                    "group_by": "risk_level",
+                },
+                {
+                    "key": "ip_application_control_excel",
+                    "name": "IP事务管控表之申请管控表 · Excel",
+                    "format": "excel",
+                    "view_key": "ip_application_control",
+                    "fields": ["application_number", "publication_number", "grant_number", "title", "applicant", "inventor", "agent", "filing_date", "publication_date", "grant_date", "application_status", "legal_status"],
+                },
+                {
+                    "key": "patent_analysis_work_file",
+                    "name": "专利检索分析工作文件 · Word",
+                    "format": "word",
+                    "view_key": "daily_patent_accumulation",
+                    "fields": ["publication_number", "title", "abstract", "claims", "applicant", "inventor", "ipc_main", "priority_date", "legal_status", "risk_level", "notes"],
+                },
+                {
+                    "key": "daily_patent_accumulation_csv",
+                    "name": "日常相关专利积累 · CSV",
+                    "format": "csv",
+                    "view_key": "daily_patent_accumulation",
+                    "fields": ["application_number", "publication_number", "title", "country", "category", "subcategory", "applicant", "ipc_main", "legal_status", "notes"],
+                },
+            ]
+            for definition in export_templates:
+                if db.query(PatentExportTemplate).filter(
+                    PatentExportTemplate.database_id == database.id,
+                    PatentExportTemplate.template_key == definition["key"],
+                ).first():
+                    continue
+                view = view_by_key.get(definition["view_key"])
+                db.add(PatentExportTemplate(
+                    database_id=database.id,
+                    view_id=view.id if view else None,
+                    template_key=definition["key"],
+                    name=definition["name"],
+                    description="系统提供的工作文件模板；输出时自动附带模板版本、字段来源和筛选条件。",
+                    output_format=definition["format"],
+                    field_keys=definition["fields"],
+                    filter_config={},
+                    sort_config={"sort_by": "filing_date", "sort_order": "desc"},
+                    group_by=definition.get("group_by"),
+                    version=1,
+                    is_system=True,
+                ))
+
+        if db.query(TagGroup).count() == 0:
+            tag_groups = [
+                TagGroup(name="技术领域", color="#1890ff", description="按技术分类的标签组"),
+                TagGroup(name="风险等级", color="#ff4d4f", description="专利风险标签"),
+                TagGroup(name="项目状态", color="#52c41a", description="项目关联状态"),
+                TagGroup(name="质量标签", color="#faad14", description="专利质量评估"),
+            ]
+            db.add_all(tag_groups)
+
+        default_ai_fields = [
+            {
+                "key": "ai_technical_problem",
+                "name": "AI提取-技术问题",
+                "field_type": CustomFieldType.AI_FIELD,
+                "group_name": "AI抽取",
+                "description": "从专利文本中自动提取本专利要解决的技术问题",
+                "sort_order": 1,
+                "ai_config": {
+                    "prompt_template": """请阅读以下专利信息，提取该专利要解决的**技术问题**。
+要求：
+1. 用简洁准确的语言描述，不超过100字
+2. 聚焦于技术层面的问题，不要泛泛而谈
+3. 如果无法确定，返回"未明确说明"
+
+专利标题：{title}
+专利摘要：{abstract}
+
+直接给出技术问题："""
+                },
+            },
+            {
+                "key": "ai_technical_solution",
+                "name": "AI提取-技术方案",
+                "field_type": CustomFieldType.AI_FIELD,
+                "group_name": "AI抽取",
+                "description": "从专利文本中自动提取核心技术方案",
+                "sort_order": 2,
+                "ai_config": {
+                    "prompt_template": """请阅读以下专利信息，提取该专利的**核心技术方案**。
+要求：
+1. 分点概括关键技术手段，不超过200字
+2. 突出与现有技术的区别点
+3. 结构清晰，便于快速理解
+
+专利标题：{title}
+专利摘要：{abstract}
+
+直接给出技术方案要点："""
+                },
+            },
+            {
+                "key": "ai_technical_effect",
+                "name": "AI提取-技术效果",
+                "field_type": CustomFieldType.AI_FIELD,
+                "group_name": "AI抽取",
+                "description": "从专利文本中自动提取能达到的技术效果",
+                "sort_order": 3,
+                "ai_config": {
+                    "prompt_template": """请阅读以下专利信息，提取该专利能够实现的**技术效果/有益效果**。
+要求：
+1. 列出主要的有益效果，不超过150字
+2. 效果要与技术方案对应，具体可衡量
+3. 如果无法确定，返回"未明确说明"
+
+专利标题：{title}
+专利摘要：{abstract}
+
+直接给出技术效果："""
+                },
+            },
+            {
+                "key": "ai_risk_assessment",
+                "name": "AI风险初评",
+                "field_type": CustomFieldType.AI_FIELD,
+                "group_name": "AI抽取",
+                "description": "AI初步评估专利侵权风险等级",
+                "sort_order": 4,
+                "ai_config": {
+                    "prompt_template": """请阅读以下专利信息，从**我方产品可能侵权的角度**进行初步风险评估。
+要求：
+1. 风险等级分为：高/中/低/无
+2. 简要说明理由（50字以内）
+3. 输出格式：风险等级：X，理由：XXX
+
+专利标题：{title}
+专利摘要：{abstract}
+申请人：{applicant}
+法律状态：{legal_status}
+
+给出你的评估："""
+                },
+            },
+            {
+                "key": "ai_keywords",
+                "name": "AI关键词",
+                "field_type": CustomFieldType.AI_FIELD,
+                "group_name": "AI抽取",
+                "description": "自动提取专利核心技术关键词",
+                "sort_order": 5,
+                "ai_config": {
+                    "prompt_template": """请阅读以下专利信息，提取5-8个最核心的**技术关键词**。
+要求：
+1. 关键词要精准代表该专利的技术主题
+2. 用英文逗号分隔
+3. 不要加序号或其他符号
+
+专利标题：{title}
+专利摘要：{abstract}
+
+直接给出关键词："""
+                },
+            },
+            {
+                "key": "ai_summary",
+                "name": "AI摘要总结",
+                "field_type": CustomFieldType.AI_FIELD,
+                "group_name": "AI抽取",
+                "description": "一句话总结专利核心创新点",
+                "sort_order": 6,
+                "ai_config": {
+                    "prompt_template": """请用**一句话**（不超过80字）总结下面这件专利的核心创新点和价值。
+要求：语言精炼，突出"做了什么+解决了什么+好在哪里"。
+
+专利标题：{title}
+专利摘要：{abstract}
+
+一句话总结："""
+                },
+            },
+        ]
+
+        for f in default_ai_fields:
+            existing = db.query(CustomField).filter(CustomField.key == f["key"]).first()
+            if not existing:
+                db.add(CustomField(**f))
+
+        db.commit()
+        print("[OK] 默认数据初始化完成！")
+        print("   - 3个默认部门：检索组、分析组、撰写组")
+        print("   - 1个默认数据库：默认数据库（DEFAULT）")
+        print("   - 4个标签组：技术领域、风险等级、项目状态、质量标签")
+        print(f"   - {len(default_ai_fields)}个AI字段模板")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    init_db()
+    init_default_data()

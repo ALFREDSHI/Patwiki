@@ -1,0 +1,54 @@
+from fastapi import APIRouter
+
+from app.api.patents import router as patents_router
+from app.api.meta import router as meta_router
+from app.api.imports import router as imports_router
+from app.api.ai import router as ai_router
+from app.api.settings import router as settings_router
+from app.api.fields import router as fields_router
+from app.api.databases import router as databases_router
+from app.api.analytics import router as analytics_router
+from app.api.sharing import router as sharing_router
+from app.api.views import router as views_router
+from app.api.links import router as links_router  # 通用关联字段
+from app.api.public_shares import router as public_shares_router  # 单专利 Wiki 分享
+from app.api.search import router as search_router  # 搜索自动补全
+from app.api.formula import router as formula_router  # 公式字段
+from app.api.export import router as export_router  # 数据导出
+from app.api.form import router as form_router  # 公开表单
+from app.api.automation import router as automation_router  # 自动化规则
+from app.api.attachments import router as attachments_router  # 附件字段
+from app.api.dashboards import router as dashboards_router  # 可配置仪表盘
+from app.api.comments import router as comments_router  # 协作评论
+from app.api.project_risk import router as project_risk_router
+from app.api.system import router as system_router
+from app.api.sync import router as sync_router
+from app.api.semantic_search import router as semantic_search_router
+from app.api.collaboration_sync import router as collaboration_sync_router
+
+api_router = APIRouter()
+api_router.include_router(databases_router)
+api_router.include_router(patents_router)
+api_router.include_router(meta_router)
+api_router.include_router(imports_router)
+api_router.include_router(ai_router)
+api_router.include_router(settings_router)
+api_router.include_router(fields_router)
+api_router.include_router(analytics_router)
+api_router.include_router(sharing_router)
+api_router.include_router(views_router)
+api_router.include_router(links_router)
+api_router.include_router(public_shares_router)
+api_router.include_router(search_router)
+api_router.include_router(formula_router)
+api_router.include_router(export_router)
+api_router.include_router(form_router)
+api_router.include_router(automation_router)
+api_router.include_router(attachments_router)
+api_router.include_router(dashboards_router)
+api_router.include_router(comments_router)
+api_router.include_router(project_risk_router)
+api_router.include_router(system_router)
+api_router.include_router(sync_router)
+api_router.include_router(semantic_search_router)
+api_router.include_router(collaboration_sync_router)
