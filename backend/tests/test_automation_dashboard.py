@@ -41,7 +41,7 @@ class AutomationDashboardApiTest(unittest.TestCase):
         )
         Base.metadata.create_all(self.engine)
         self.db = Session(self.engine)
-        self.database = PatentDatabase(name="M5 测试库", code="M5_TEST")
+        self.database = PatentDatabase(name="测试库", code="TEST_DB")
         self.db.add(self.database)
         self.db.flush()
         self.patent = Patent(

@@ -29,6 +29,7 @@ from app.services.patent_identity_service import (
 from app.services.sync_support import (
     LEGAL_STATUS_MAP,
     SAFE_EXTERNAL_FIELDS,
+    REVIEWABLE_EXTERNAL_FIELDS,
     date_value,
     hash_payload,
     now,
@@ -87,9 +88,10 @@ def record_observation(
     patent: Patent | None,
     field_key: str,
     candidate: Any,
+    database_id: int,
     review_policy: str,
 ) -> ExternalFactObservation:
-    current = getattr(patent, field_key, None) if patent else None
+    current = ((patent.custom_fields or {}).get(field_key) if patent and (field_key.startswith("mcp_") or field_key in {"family_members", "cited_patents", "citing_patents"}) else getattr(patent, field_key, None)) if patent else None
     current_serialized = serialize_value(current)
     candidate_serialized = serialize_value(candidate)
     changed = current_serialized != candidate_serialized
@@ -113,7 +115,12 @@ def record_observation(
     db.add(observation)
     db.flush()
     if auto_apply:
-        setattr(patent, field_key, date_value(candidate) if field_key.endswith("_date") else candidate)
+        if field_key.startswith("mcp_"):
+            values = dict(patent.custom_fields or {})
+            values[field_key] = candidate
+            patent.custom_fields = values
+        else:
+            setattr(patent, field_key, date_value(candidate) if field_key.endswith("_date") else candidate)
         db.add(PatentHistory(
             patent_id=patent.id,
             field_key=field_key,
@@ -122,6 +129,21 @@ def record_observation(
             source="external_sync",
             changed_by="sync-engine",
         ))
+        from app.services.import_governance_service import record_import_field_change
+        record_import_field_change(
+            db,
+            patent=patent,
+            field_key=field_key,
+            old_value=current,
+            incoming_value=candidate,
+            final_value=candidate,
+            database_id=database_id,
+            source_kind="external_sync",
+            source_label=f"外部连接器 #{run.connector_id}",
+            source_reference=f"run:{run.id}:record:{sync_record.id}",
+            decided_by="sync-engine",
+            reason="安全字段自动同步",
+        )
     return observation
 
 
@@ -174,6 +196,7 @@ def apply_legal_events(
         mapped_status = LEGAL_STATUS_MAP.get(latest.status, "unknown")
         current_status = patent.legal_status.value if hasattr(patent.legal_status, "value") else patent.legal_status
         if current_status != mapped_status:
+            previous_legal_status_date = patent.legal_status_date
             db.add(PatentHistory(
                 patent_id=patent.id,
                 field_key="legal_status",
@@ -184,6 +207,35 @@ def apply_legal_events(
             ))
             patent.legal_status = LegalStatus(mapped_status)
             patent.legal_status_date = latest.event_date
+            from app.services.import_governance_service import record_import_field_change
+            record_import_field_change(
+                db,
+                patent=patent,
+                field_key="legal_status",
+                old_value=current_status,
+                incoming_value=mapped_status,
+                final_value=mapped_status,
+                database_id=database_id,
+                source_kind="external_sync",
+                source_label=f"外部连接器 #{run.connector_id}",
+                source_reference=f"run:{run.id}:legal:{latest.provider_event_id}",
+                decided_by="sync-engine",
+                reason="外部法律状态事件",
+            )
+            record_import_field_change(
+                db,
+                patent=patent,
+                field_key="legal_status_date",
+                old_value=previous_legal_status_date,
+                incoming_value=latest.event_date,
+                final_value=latest.event_date,
+                database_id=database_id,
+                source_kind="external_sync",
+                source_label=f"外部连接器 #{run.connector_id}",
+                source_reference=f"run:{run.id}:legal-date:{latest.provider_event_id}",
+                decided_by="sync-engine",
+                reason="外部法律状态事件日期",
+            )
     # A provider may return a current legal state without a dated event. Keep
     # the current projection accurate, but do not invent an event timestamp.
     current_provider_status = record.fields.get("legal_status")
@@ -202,6 +254,21 @@ def apply_legal_events(
                 changed_by="sync-engine",
             ))
             patent.legal_status = LegalStatus(mapped_provider_status)
+            from app.services.import_governance_service import record_import_field_change
+            record_import_field_change(
+                db,
+                patent=patent,
+                field_key="legal_status",
+                old_value=current_status,
+                incoming_value=mapped_provider_status,
+                final_value=mapped_provider_status,
+                database_id=database_id,
+                source_kind="external_sync",
+                source_label=f"外部连接器 #{run.connector_id}",
+                source_reference=f"run:{run.id}:legal:current",
+                decided_by="sync-engine",
+                reason="外部来源当前法律状态",
+            )
             dedupe_key = hash_payload({
                 "patent": patent.id,
                 "type": "legal_status_changed",
@@ -278,9 +345,12 @@ def process_record(db: Session, run: SyncRun, subscription: SyncSubscription, re
         configured_fields = status_strategy["update_fields"]
     selected_fields = set(configured_fields) if isinstance(configured_fields, list) else SAFE_EXTERNAL_FIELDS | {"legal_status"}
     for field_key, value in record.fields.items():
-        if field_key not in SAFE_EXTERNAL_FIELDS or field_key not in selected_fields or value is None:
+        if field_key not in REVIEWABLE_EXTERNAL_FIELDS or field_key not in selected_fields or value is None:
             continue
-        observation = record_observation(db, run, snapshot, sync_record, patent, field_key, value, subscription.review_policy)
+        observation = record_observation(
+            db, run, snapshot, sync_record, patent, field_key, value,
+            subscription.database_id, subscription.review_policy,
+        )
         run.counts_json["observations"] += 1
         if observation.decision == "auto_applied":
             run.counts_json["auto_applied"] += 1

@@ -119,6 +119,7 @@ class CustomFieldHandler(FieldHandler):
             "is_ai": field.ai_config is not None,
             "is_formula": is_formula,
             "ai_config": field.ai_config,
+            "mapped_system_key": (field.ai_config or {}).get("mapped_system_key"),
             "formula_config": field.formula_config,
             "link_config": field.link_config,
             "lookup_config": field.lookup_config,
@@ -154,6 +155,37 @@ class PatentAttachmentFieldHandler(FieldHandler):
         "visible": True,
         "is_system": False,
         "description": "与专利关联的邮件、演示文稿、专利原文、图片和会议材料",
+    }
+
+    def list_fields(self, db=None) -> list[FieldMeta]:
+        return [dict(self.definition)]
+
+    def read_value(self, record: Any, key: str) -> Any:
+        return (getattr(record, "custom_fields", None) or {}).get(key)
+
+    def write_value(self, record: Any, key: str, value: Any) -> None:
+        values = dict(getattr(record, "custom_fields", None) or {})
+        values[key] = value
+        record.custom_fields = values
+
+
+class PatentFiguresFieldHandler(FieldHandler):
+    """Patent figures are stored separately from the general attachment library."""
+
+    definition: FieldMeta = {
+        "key": "patent_figures",
+        "name": "专利附图",
+        "field_type": "attachment",
+        "group_name": "文档",
+        "options": None,
+        "width": 260,
+        "sortable": False,
+        "filterable": False,
+        "editable": True,
+        "frozen": False,
+        "visible": True,
+        "is_system": False,
+        "description": "专利附图专区：聚合 Excel 导入、MCP 更新与手动上传的图片，不进入统一附件库",
     }
 
     def list_fields(self, db=None) -> list[FieldMeta]:
@@ -789,7 +821,7 @@ SYSTEM_FIELD_DEFINITIONS = [
 SYSTEM_FIELD_HANDLERS = tuple(SystemFieldHandler(definition) for definition in SYSTEM_FIELD_DEFINITIONS)
 SYSTEM_FIELDS_REGISTRY = [handler.list_fields()[0] for handler in SYSTEM_FIELD_HANDLERS]
 SYSTEM_FIELD_KEYS = {field["key"] for field in SYSTEM_FIELDS_REGISTRY}
-FIELD_REGISTRY = FieldRegistry((*SYSTEM_FIELD_HANDLERS, PatentAttachmentFieldHandler(), PatentOriginalLinksFieldHandler(), CustomFieldHandler()))
+FIELD_REGISTRY = FieldRegistry((*SYSTEM_FIELD_HANDLERS, PatentAttachmentFieldHandler(), PatentFiguresFieldHandler(), PatentOriginalLinksFieldHandler(), CustomFieldHandler()))
 
 
 def get_system_field_meta(key: str) -> FieldMeta | None:
@@ -797,4 +829,7 @@ def get_system_field_meta(key: str) -> FieldMeta | None:
 
 
 def get_all_fields_meta(db) -> list[FieldMeta]:
-    return [*FIELD_REGISTRY.list_fields(db), *get_pending_import_fields(db)]
+    if db is None:
+        return FIELD_REGISTRY.list_fields(None)
+    from app.services.field_policy_service import enrich_field_policies
+    return enrich_field_policies(db, [*FIELD_REGISTRY.list_fields(db), *get_pending_import_fields(db)])

@@ -153,11 +153,12 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="patwiki-backend",
+    icon=str(backend_root.parent / "src-tauri" / "icons" / "icon.ico") if sys.platform == "win32" else None,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,  # 保留控制台便于调试；Tauri 会隐藏
+    console=True,  # Keep stdout/stderr available; Tauri uses CREATE_NO_WINDOW.
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

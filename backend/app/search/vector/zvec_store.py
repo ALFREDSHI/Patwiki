@@ -32,7 +32,7 @@ class ZvecVectorStore:
         # document ID remains unchanged in SQLite state; only its index key is encoded.
         patent_id, document_type, chunk_index = document_id.split(":", 2)
         if document_type == "patent_summary":
-            # Preserve the summary key so existing active summary indexes remain deletable.
+            # Preserve the key so existing active summary indexes remain deletable.
             return f"p{patent_id}_summary_{chunk_index}"
         return f"p{patent_id}_{document_type.replace('-', '_')}_{chunk_index}"
 

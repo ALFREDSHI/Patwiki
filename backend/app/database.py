@@ -78,6 +78,10 @@ def _ensure_master_views():
                     column_config=[],
                     sort_config={"sort_by": "filing_date", "sort_order": "desc"},
                 )
+        from app.services.canonical_wiki_migration_service import upgrade_canonical_wiki
+        upgrade_canonical_wiki(db)
+        from app.services.publication_version_service import backfill_versions
+        backfill_versions(db)
     finally:
         db.close()
 

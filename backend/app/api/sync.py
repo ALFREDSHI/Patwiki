@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from jsonschema import Draft202012Validator
 
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.core.time import utc_now_naive
@@ -20,6 +21,7 @@ from app.models import (
     SavedPatentQuery,
     SyncRun,
     SyncSubscription,
+    SyncLease,
     Patent,
     SyncUpdateBatch,
     WatchEvent,
@@ -28,6 +30,7 @@ from app.schemas.sync import (
     ConnectorCreate,
     ConnectorUpdate,
     CredentialCreate,
+    McpToolMapPreviewRequest,
     ObservationDecisionRequest,
     PatentRefreshRequest,
     RunRequest,
@@ -53,6 +56,12 @@ class PublicationMatchRequest(BaseModel):
     database_id: int
     publications: list[str] = Field(default_factory=list, max_length=500)
     patent_ids: list[int] = Field(default_factory=list, max_length=500)
+
+
+class McpToolRequest(BaseModel):
+    service: str = Field(min_length=1, max_length=150)
+    tool: str = Field(min_length=1, max_length=150)
+    arguments: dict = Field(default_factory=dict)
 
 
 @router.post("/resolve-publications")
@@ -264,6 +273,10 @@ def discover_connector_tools(connector_id: int, db: Session = Depends(get_db)):
         if not callable(discover):
             raise BadRequestException("该连接器不支持 MCP 工具发现")
         catalog = discover()
+        from app.integrations.himmpat import tool_mappable_fields
+        for service in catalog.get("services", []):
+            for tool in service.get("tools", []):
+                tool["mappable_fields"] = tool_mappable_fields(tool.get("name"))
         connector.mcp_catalog_json = catalog
         from app.core.time import utc_now_naive
         connector.mcp_catalog_updated_at = utc_now_naive()
@@ -283,6 +296,130 @@ def discover_connector_tools(connector_id: int, db: Session = Depends(get_db)):
             close = getattr(runtime_connector, "close", None)
             if callable(close):
                 close()
+
+
+@router.post("/connectors/{connector_id}/tools/call")
+def call_connector_tool(connector_id: int, body: McpToolRequest, db: Session = Depends(get_db)):
+    connector = _require_connector(db, connector_id)
+    if not connector.enabled:
+        raise BadRequestException("连接器已停用")
+    catalog = connector.mcp_catalog_json or {}
+    tool = next((tool for service in catalog.get("services", []) if service.get("service") == body.service
+                 for tool in service.get("tools", []) if tool.get("name") == body.tool), None)
+    if tool is None:
+        raise BadRequestException("工具不在当前连接器目录中，请先发现工具")
+    schema = tool.get("inputSchema") or {}
+    errors = list(Draft202012Validator(schema).iter_errors(body.arguments))
+    if errors:
+        # Schema errors may include the submitted value, so expose only the
+        # path and rule rather than echoing image data or user documents.
+        first = errors[0]
+        path = ".".join(str(part) for part in first.absolute_path) or "arguments"
+        raise BadRequestException(f"工具参数 {path} 不符合规则：{first.validator}")
+    runtime = None
+    try:
+        runtime = get_connector(connector)
+        call = getattr(runtime, "call_discovered_tool", None)
+        if not callable(call):
+            raise BadRequestException("该连接器不支持工具调用")
+        data, evidence = call(body.service, body.tool, body.arguments)
+        from app.models import ExternalSnapshot
+        from app.services.sync_support import hash_payload
+        run = SyncRun(connector_id=connector.id, trigger="mcp_tool", status="succeeded",
+                      started_at=utc_now_naive(), finished_at=utc_now_naive(),
+                      counts_json={"tools": 1})
+        db.add(run)
+        db.flush()
+        snapshot = ExternalSnapshot(connector_id=connector.id,
+                                    sync_run_id=run.id,
+                                    request_metadata={"mode": "mcp_tool", "service": body.service, "tool": body.tool},
+                                    payload_json=evidence, payload_hash=hash_payload(evidence), source_version="himmpat-mcp")
+        db.add(snapshot)
+        db.commit()
+        return {"data": data, "snapshot_id": snapshot.id, "service": body.service, "tool": body.tool}
+    except BadRequestException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise BadRequestException(f"MCP 工具调用失败：{exc}") from exc
+    finally:
+        if runtime is not None:
+            close = getattr(runtime, "close", None)
+            if callable(close):
+                close()
+
+
+@router.post("/connectors/{connector_id}/tools/map-preview")
+def map_tool_result_preview(connector_id: int, body: McpToolMapPreviewRequest, db: Session = Depends(get_db)):
+    connector = _require_connector(db, connector_id)
+    if not connector.enabled:
+        raise BadRequestException("连接器已停用")
+    _require_database(db, body.database_id)
+    patent = db.query(Patent).filter(Patent.id == body.patent_id).first()
+    if not patent:
+        raise NotFoundException("专利不存在")
+    catalog = connector.mcp_catalog_json or {}
+    tool = next((tool for service in catalog.get("services", []) if service.get("service") == body.service
+                 for tool in service.get("tools", []) if tool.get("name") == body.tool), None)
+    if tool is None:
+        raise BadRequestException("工具不在当前连接器目录中，请先发现工具")
+    schema = tool.get("inputSchema") or {}
+    errors = list(Draft202012Validator(schema).iter_errors(body.arguments))
+    if errors:
+        first = errors[0]
+        path = ".".join(str(part) for part in first.absolute_path) or "arguments"
+        raise BadRequestException(f"工具参数 {path} 不符合规则：{first.validator}")
+    from app.integrations.himmpat import tool_mappable_fields
+    mappable = tool_mappable_fields(body.tool)
+    if not mappable:
+        raise BadRequestException("该工具的结果暂不支持映射到专利字段")
+    runtime = None
+    try:
+        runtime = get_connector(connector)
+        call = getattr(runtime, "call_discovered_tool", None)
+        extract = getattr(runtime, "extract_mapped_fields", None)
+        if not callable(call) or not callable(extract):
+            raise BadRequestException("该连接器不支持工具结果映射")
+        data, evidence = call(body.service, body.tool, body.arguments)
+        patent_id = _external_patent_id(body.arguments)
+        mapped = extract(body.tool, data, patent_id)
+        if not mapped:
+            raise BadRequestException("未能从工具结果中识别出可写入的字段")
+        record = ProviderPatentRecord(
+            external_record_id=str(patent_id or patent.publication_number or patent.id),
+            identifiers=tuple(SyncUpdateService._identifiers(patent)),
+            fields=mapped,
+            source_version="himmpat-mcp",
+            raw_payload=evidence,
+        )
+        batch = SyncUpdateService.preview_from_records(
+            db, connector, body.database_id, {patent.id: record}, body.fields,
+            request_metadata={"mode": "mcp_tool_map", "service": body.service, "tool": body.tool},
+        )
+    except BadRequestException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise BadRequestException(f"MCP 工具结果映射失败：{exc}") from exc
+    finally:
+        if runtime is not None:
+            close = getattr(runtime, "close", None)
+            if callable(close):
+                close()
+    return SyncUpdateService._batch_dict(batch)
+
+
+def _external_patent_id(arguments: dict) -> str | None:
+    for key in ("id", "patentId", "patent_id"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, list) and value:
+            return str(value[0])
+    ids = arguments.get("ids")
+    if isinstance(ids, list) and ids:
+        return str(ids[0])
+    return None
 
 
 @router.get("/connectors/{connector_id}/credentials")
@@ -358,7 +495,22 @@ def list_subscriptions(database_id: int | None = None, db: Session = Depends(get
     query = db.query(SyncSubscription)
     if database_id is not None:
         query = query.filter(SyncSubscription.database_id == database_id)
-    return {"items": [SyncService.subscription_dict(item) for item in query.order_by(SyncSubscription.id.desc()).all()]}
+    return {"items": [SyncService.subscription_dict(item) for item in query.order_by(SyncSubscription.id.desc()).all() if not (item.schedule_json or {}).get("deleted_at")]}
+
+
+@router.delete("/subscriptions/{subscription_id}")
+def delete_subscription(subscription_id: int, db: Session = Depends(get_db)):
+    subscription = db.query(SyncSubscription).filter(SyncSubscription.id == subscription_id).first()
+    if not subscription:
+        raise NotFoundException("同步订阅不存在")
+    lease = db.query(SyncLease).filter(SyncLease.subscription_id == subscription_id).first()
+    if lease and lease.expires_at > utc_now_naive():
+        raise BadRequestException("规则正在运行，请等待运行结束后删除")
+    subscription.enabled = False
+    subscription.next_run_at = None
+    subscription.schedule_json = {**(subscription.schedule_json or {}), "deleted_at": utc_now_naive().isoformat()}
+    db.commit()
+    return {"success": True}
 
 
 @router.post("/subscriptions")
@@ -506,7 +658,7 @@ def refresh_patent(body: PatentRefreshRequest, db: Session = Depends(get_db)):
         database_id = body.database_id
     identifier = ProviderIdentifier(identifier_type=body.identifier_type, raw_value=body.identifier)
     try:
-        run = SyncService.refresh_patent(db, connector, identifier, database_id, body.review_policy)
+        run = SyncService.refresh_patent(db, connector, identifier, database_id, body.review_policy, body.fields)
     except Exception as exc:
         raise BadRequestException(f"专利刷新失败：{exc}") from exc
     return SyncService.run_dict(run)
@@ -534,17 +686,23 @@ def list_run_records(run_id: int, limit: int = Query(500, ge=1, le=2000), db: Se
     if not run:
         raise NotFoundException("同步运行不存在")
     from app.models import SyncRecord
-    records = db.query(SyncRecord).filter(SyncRecord.sync_run_id == run_id).order_by(SyncRecord.id).limit(limit).all()
+    from sqlalchemy.orm import joinedload
+    records = (db.query(SyncRecord)
+               .options(joinedload(SyncRecord.patent), joinedload(SyncRecord.snapshot))
+               .filter(SyncRecord.sync_run_id == run_id).order_by(SyncRecord.id).limit(limit).all())
     return {"items": [SyncService.record_dict(item) for item in records]}
 
 
 @router.get("/observations")
-def list_observations(decision: str | None = None, patent_id: int | None = None, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
+def list_observations(decision: str | None = None, patent_id: int | None = None, run_id: int | None = None,
+                      limit: int = Query(100, ge=1, le=2000), db: Session = Depends(get_db)):
     query = db.query(ExternalFactObservation)
     if decision:
         query = query.filter(ExternalFactObservation.decision == decision)
     if patent_id is not None:
         query = query.filter(ExternalFactObservation.patent_id == patent_id)
+    if run_id is not None:
+        query = query.filter(ExternalFactObservation.sync_run_id == run_id)
     return {"items": [SyncService.observation_dict(item) for item in query.order_by(ExternalFactObservation.id.desc()).limit(limit).all()]}
 
 

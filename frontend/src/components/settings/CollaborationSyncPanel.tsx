@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { collaborationSyncApi, databaseApi, productApi } from '../../api'
 import type { CollaborationIdentity, CollaborationPackage, PatentDatabase, Product } from '../../types'
 import { getErrorMessage } from '../../lib/errors'
 import SyncAggregationPanel from './SyncAggregationPanel'
+import Icon from '../common/Icon'
 
 const TOKEN_KEY = 'patwiki_collaboration_token'
 const fields = [
@@ -40,6 +42,7 @@ type ApplyConflict = { entity_uid: string; field_key: string; base_value: unknow
 type ApplyPreview = { create_count: number; update_count: number; unchanged_count: number; conflicts: ApplyConflict[] }
 
 export default function CollaborationSyncPanel() {
+  const navigate = useNavigate()
   const [configured, setConfigured] = useState<boolean | null>(null)
   const [setupPath, setSetupPath] = useState('')
   const [identity, setIdentity] = useState<CollaborationIdentity | null>(null)
@@ -97,6 +100,7 @@ export default function CollaborationSyncPanel() {
   const [applyDatabaseId, setApplyDatabaseId] = useState('')
   const [applyEditPassword] = useState('')
   const [applyPreview, setApplyPreview] = useState<ApplyPreview | null>(null)
+  const [governanceTargetDatabaseId, setGovernanceTargetDatabaseId] = useState('')
   const [applyDecisions, setApplyDecisions] = useState<Record<string, 'local' | 'remote'>>({})
 
   const isAdmin = useMemo(() => Boolean(identity?.roles.some(role => role === 'system_admin' || role === 'department_leader')), [identity])
@@ -202,7 +206,30 @@ export default function CollaborationSyncPanel() {
     try { await collaborationSyncApi.logout() } catch { /* Expired sessions can still be cleared locally. */ }
     localStorage.removeItem(TOKEN_KEY)
     setIdentity(null)
+    setAccounts([])
+    setPassword('')
     setMessage('已退出协同账号')
+  }
+
+  const handleDeleteAccount = async (account: CollaborationIdentity) => {
+    if (!window.confirm(`确认删除协同账号“${account.display_name || account.username}”？登录和协同权限将被移除，历史记录保留。`)) return
+    setBusy(true)
+    try { await collaborationSyncApi.deleteAccount(account.id); setMessage(`账号 ${account.username} 已删除`); await loadAdminData() }
+    catch (error: unknown) { setMessage(getErrorMessage(error, '删除账号失败')) }
+    finally { setBusy(false) }
+  }
+
+  const downloadSample = async () => {
+    try {
+      const response = await fetch(`${import.meta.env.BASE_URL}examples/patwiki-employee-config.example.json`)
+      if (!response.ok) throw new Error('样例文件读取失败')
+      const url = URL.createObjectURL(await response.blob())
+      const anchor = document.createElement('a')
+      anchor.href = url; anchor.download = 'patwiki-employee-config.example.json'
+      document.body.appendChild(anchor); anchor.click(); anchor.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+      setMessage('格式样例 patwiki-employee-config.example.json 已发起下载；浏览器中可在下载列表查看，也可以点击“查看格式样例”直接打开。')
+    } catch (error: unknown) { setMessage(getErrorMessage(error, '样例下载失败')) }
   }
 
   const handleChangePassword = async () => {
@@ -297,6 +324,7 @@ export default function CollaborationSyncPanel() {
         database_id: Number(applyDatabaseId), edit_password: applyEditPassword || undefined, decisions,
       })
       setMessage(`主表应用完成：新增 ${result.created} 条、更新 ${result.updated} 条、待处理冲突 ${result.pending_conflicts} 项；同步前备份：${result.backup_path || '未生成（仅内存数据库）'}`)
+      setGovernanceTargetDatabaseId(result.pending_conflicts ? applyDatabaseId : '')
       setApplyPreview(null); setApplyDecisions({})
       await loadPackages()
     } catch (error: unknown) { setMessage(getErrorMessage(error, '主表应用失败')) }
@@ -360,11 +388,17 @@ export default function CollaborationSyncPanel() {
   return <section style={panelStyle} aria-label="部门协同同步">
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, borderBottom: '1px solid #e2e8f0', paddingBottom: 12, marginBottom: 14 }}>
       <div><h3 style={{ margin: 0, fontSize: 15, color: '#1f2937' }}>部门协同与数据同步</h3><div style={{ marginTop: 4, fontSize: 12, color: '#64748b' }}>加密文件交换 · 默认只读 · 本地留存审计记录</div></div>
-      {identity && <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}><span style={{ fontSize: 12, color: '#334155' }}>{identity.display_name || identity.username} · {identity.roles.join(', ') || '成员'}</span><button style={buttonStyle} onClick={() => void handleLogout()}>退出</button></div>}
+      {identity && <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10 }}><span style={{ fontSize: 12, color: '#334155' }}>{identity.display_name || identity.username} · {identity.roles.join(', ') || '成员'}</span><button style={buttonStyle} onClick={() => void handleLogout()}>登出协同账号</button>{isAdmin && <a href="#collaboration-accounts" style={{ fontSize: 12 }}>账号管理与删除</a>}</div>}
     </div>
 
     {!identity && <div style={{ display: 'grid', gap: 10, maxWidth: 680 }}>
-      <label style={{ fontSize: 13 }}>成员初始化 / 权限更新文件<input type="file" accept=".json" disabled={busy} onChange={event => { const file = event.target.files?.[0]; if (!file) return; setBusy(true); void collaborationSyncApi.importEmployeeConfig(file).then(result => { setLoginName(result.username); setConfigured(true); setMessage(`成员配置已导入：${result.username}`) }).catch(error => setMessage(getErrorMessage(error))).finally(() => setBusy(false)); event.target.value = '' }} /></label>
+      <div className="member-config-import">
+        <Icon name="file" size={28} />
+        <div className="member-config-description"><strong>成员初始化 / 权限更新</strong><span>管理员签发的 JSON 配置文件</span></div>
+        <label className={`btn btn-primary member-config-picker ${busy ? 'is-disabled' : ''}`}><Icon name="download" />{busy ? '导入中...' : '选择配置文件'}<input type="file" accept=".json,application/json" disabled={busy} onChange={event => { const file = event.target.files?.[0]; if (!file) return; setBusy(true); void collaborationSyncApi.importEmployeeConfig(file).then(result => { setLoginName(result.username); setConfigured(true); setMessage(`成员配置已导入：${result.username}`) }).catch(error => setMessage(getErrorMessage(error))).finally(() => setBusy(false)); event.target.value = '' }} /></label>
+        <button className="btn btn-secondary" type="button" onClick={() => void downloadSample()}><Icon name="download" />格式样例</button>
+      </div>
+      <a href={`${import.meta.env.BASE_URL}examples/patwiki-employee-config.example.json`} target="_blank" rel="noreferrer">查看格式样例</a>
       {configured ? <><strong style={{ fontSize: 13 }}>协同账号登录</strong>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8 }}>
           <input style={inputStyle} value={loginName} onChange={event => setLoginName(event.target.value)} placeholder="协同账号" autoComplete="username" />
@@ -409,14 +443,14 @@ export default function CollaborationSyncPanel() {
       </div>}
       {isAdmin && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 14, marginBottom: 18 }}>
         <div style={{ borderTop: '2px solid #0f766e', paddingTop: 10 }}>
-          <h4 style={{ margin: '0 0 8px', fontSize: 13 }}>协同账号</h4>
+          <h4 id="collaboration-accounts" style={{ margin: '0 0 8px', fontSize: 13 }}>协同账号管理与删除</h4>
           <div style={{ display: 'grid', gap: 7, marginBottom: 10 }}>
             <input style={inputStyle} value={departmentCode} placeholder="部门标识" onChange={event => setDepartmentCode(event.target.value)} />
             <select style={inputStyle} aria-label="成员配置账号" value={configAccount} onChange={event => setConfigAccount(event.target.value)}><option value="">选择成员配置账号</option>{accounts.map(account => <option key={account.id} value={account.id}>{account.display_name || account.username}</option>)}</select>
-            <button style={buttonStyle} disabled={!departmentCode.trim() || !configAccount} onClick={() => void collaborationSyncApi.employeeConfig(Number(configAccount), departmentCode.trim()).then(blob => { const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'patwiki-employee-config.json'; anchor.click(); URL.revokeObjectURL(url) }).catch(error => setMessage(getErrorMessage(error)))}>下载成员初始化 / 权限配置</button>
+            <button style={buttonStyle} disabled={!departmentCode.trim() || !configAccount} onClick={() => void collaborationSyncApi.employeeConfig(Number(configAccount), departmentCode.trim()).then(blob => { const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'patwiki-employee-config.json'; document.body.appendChild(anchor); anchor.click(); anchor.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1000) }).catch(error => setMessage(getErrorMessage(error)))}>下载成员初始化 / 权限配置</button>
           </div>
           <div style={{ display: 'grid', gap: 7, marginBottom: 10 }}>
-            <button style={buttonStyle} onClick={() => void collaborationSyncApi.provisionTemplate().then(blob => { const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'patwiki-account-provision-template.json'; anchor.click(); URL.revokeObjectURL(url) }).catch(error => setMessage(getErrorMessage(error)))}>下载批量账号模板</button>
+            <button style={buttonStyle} onClick={() => void collaborationSyncApi.provisionTemplate().then(blob => { const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'patwiki-account-provision-template.json'; document.body.appendChild(anchor); anchor.click(); anchor.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1000) }).catch(error => setMessage(getErrorMessage(error)))}>下载批量账号模板</button>
             <input aria-label="导入批量账号配置" type="file" accept=".json,application/json" disabled={busy} onChange={event => { const file = event.target.files?.[0]; if (!file) return; setBusy(true); void collaborationSyncApi.provisionFile(file).then(() => { setMessage('批量账号已创建'); return loadAdminData() }).catch(error => setMessage(getErrorMessage(error))).finally(() => setBusy(false)); event.target.value = '' }} />
           </div>
           <div style={{ display: 'grid', gap: 7 }}>
@@ -430,8 +464,14 @@ export default function CollaborationSyncPanel() {
             <select style={inputStyle} value={newUnit} onChange={event => setNewUnit(event.target.value)}><option value="">选择所属组（可选）</option>{units.filter(unit => unit.unit_type === 'team').map(unit => <option key={unit.id} value={unit.id}>{unit.name}</option>)}</select>
             <button style={buttonStyle} disabled={busy || !loginName || password.length < 10 || (newRole === 'group_leader' && !newUnit)} onClick={() => void handleCreateAccount()}>创建账号</button>
           </div>
-          <div style={{ marginTop: 8, maxHeight: 170, overflow: 'auto', fontSize: 11, color: '#475569' }}>{accounts.map(account => <div key={account.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(90px, 1fr) minmax(105px, auto) auto', alignItems: 'center', gap: 5, padding: '3px 0' }}><span>{account.display_name || account.username} · {account.username}</span><select style={{ ...inputStyle, padding: '3px 4px', fontSize: 10 }} disabled={!account.active} value={account.roles[0] || 'member'} onChange={event => { const role = event.target.value; const unitId = account.role_assignments?.find(item => item.role === 'group_leader')?.unit_id || (newUnit ? Number(newUnit) : undefined); void collaborationSyncApi.setAccountRole(account.id, role, unitId).then(loadAdminData).catch(error => setMessage(getErrorMessage(error))) }}><option value="member">组员</option><option value="group_leader">组长</option><option value="department_leader">部门领导</option><option value="system_admin">维护管理员</option><option value="viewer">只读协作者</option></select><button style={{ ...buttonStyle, padding: '2px 5px' }} onClick={() => void collaborationSyncApi.setAccountActive(account.id, !account.active).then(loadAdminData).catch(error => setMessage(getErrorMessage(error)))}>{account.active ? '停用' : '启用'}</button></div>)}</div>
+          <div className="collaboration-account-list">{accounts.map(account => <div className="collaboration-account-row" key={account.id}>
+            <span><strong>{account.display_name || account.username}</strong><small>{account.username}</small></span>
+            <select style={inputStyle} aria-label={`${account.username} 的角色`} disabled={!account.active || busy} value={account.roles[0] || 'member'} onChange={event => { const role = event.target.value; const unitId = account.role_assignments?.find(item => item.role === 'group_leader')?.unit_id || (newUnit ? Number(newUnit) : undefined); void collaborationSyncApi.setAccountRole(account.id, role, unitId).then(loadAdminData).catch(error => setMessage(getErrorMessage(error))) }}><option value="member">组员</option><option value="group_leader">组长</option><option value="department_leader">部门领导</option><option value="system_admin">维护管理员</option><option value="viewer">只读协作者</option></select>
+            <button className="btn btn-sm btn-secondary" disabled={busy} onClick={() => void collaborationSyncApi.setAccountActive(account.id, !account.active).then(loadAdminData).catch(error => setMessage(getErrorMessage(error)))}>{account.active ? '停用' : '启用'}</button>
+            <button className="btn btn-sm btn-ghost" title={`删除 ${account.username}`} aria-label={`删除 ${account.username}`} disabled={busy || account.id === identity.id} onClick={() => void handleDeleteAccount(account)}><Icon name="trash" /></button>
+          </div>)}</div>
           <div style={{ marginTop: 6, color: '#64748b', fontSize: 11 }}>管理员和部门领导拥有本机协同管理权限；组长、组员按品类和字段授权同步；只读协作者不能应用到主表。</div>
+          <div style={{ marginTop: 6, color: '#64748b', fontSize: 11 }}>删除账号请点击成员行的垃圾桶。当前登录账号须由另一位管理员删除；唯一的管理员不能删除。</div>
         </div>
 
         <div style={{ borderTop: '2px solid #0f766e', paddingTop: 10 }}>
@@ -504,8 +544,8 @@ export default function CollaborationSyncPanel() {
           <option value="">选择已导入的成员文件</option>{packages.filter(item => item.direction === 'inbox' && ['imported', 'partially_applied'].includes(item.status)).map(item => <option key={item.package_uid} value={item.package_uid}>{item.package_uid}</option>)}
         </select>
         {packages.find(item => item.package_uid === selectedPackage)?.package_type === 'department_publication'
-          ? <button style={buttonStyle} disabled={busy} onClick={() => { setBusy(true); void collaborationSyncApi.applyDepartmentPublication(selectedPackage).then(async result => { setApplyDatabaseId(String(result.database_id)); setMessage(`部门总库已更新，待审冲突 ${result.pending_conflicts} 项`); await Promise.all([loadPackages(), loadReferenceData()]); if (result.pending_conflicts) { setApplyPackageUid(selectedPackage); const next = await collaborationSyncApi.previewApply(selectedPackage, { database_id: result.database_id }); setApplyPreview(next as ApplyPreview) } }).catch(error => setMessage(getErrorMessage(error))).finally(() => setBusy(false)) }}>建立或更新部门总库</button>
-          : sharedSources.map(source => <div key={source.database_uid} style={{ display: 'flex', gap: 8, padding: '8px 0', flexWrap: 'wrap' }}><span>{source.name}</span><button style={buttonStyle} disabled={busy} onClick={() => { setBusy(true); void collaborationSyncApi.applySharedLibrary(selectedPackage, source.database_uid).then(async result => { setMessage(`共享库导入完成：${String(result.status)}`); await Promise.all([loadPackages(), loadReferenceData()]) }).catch(error => setMessage(getErrorMessage(error))).finally(() => setBusy(false)) }}>建立或更新共享库</button></div>)}
+          ? <button style={buttonStyle} disabled={busy} onClick={() => { setBusy(true); void collaborationSyncApi.applyDepartmentPublication(selectedPackage).then(async result => { setApplyDatabaseId(String(result.database_id)); setMessage(`部门总库已更新，待审冲突 ${result.pending_conflicts} 项`); setGovernanceTargetDatabaseId(result.pending_conflicts ? String(result.database_id) : ''); await Promise.all([loadPackages(), loadReferenceData()]); if (result.pending_conflicts) { setApplyPackageUid(selectedPackage); const next = await collaborationSyncApi.previewApply(selectedPackage, { database_id: result.database_id }); setApplyPreview(next as ApplyPreview) } }).catch(error => setMessage(getErrorMessage(error))).finally(() => setBusy(false)) }}>建立或更新部门总库</button>
+          : sharedSources.map(source => <div key={source.database_uid} style={{ display: 'flex', gap: 8, padding: '8px 0', flexWrap: 'wrap' }}><span>{source.name}</span><button style={buttonStyle} disabled={busy} onClick={() => { setBusy(true); void collaborationSyncApi.applySharedLibrary(selectedPackage, source.database_uid).then(async result => { setMessage(`共享库导入完成：${String(result.status)} · 待处理冲突 ${String(result.pending_conflicts || 0)} 项`); setGovernanceTargetDatabaseId(result.pending_conflicts ? String(result.database_id) : ''); await Promise.all([loadPackages(), loadReferenceData()]) }).catch(error => setMessage(getErrorMessage(error))).finally(() => setBusy(false)) }}>建立或更新共享库</button></div>)}
         <h4 style={{ margin: '0 0 8px', fontSize: 13 }}>同步包收发记录</h4>
         {packages.length === 0 ? <div style={{ fontSize: 12, color: '#64748b' }}>暂无同步包</div> : packages.map((item: CollaborationPackage) => <div key={item.package_uid} style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto auto', alignItems: 'center', gap: 8, borderTop: '1px solid #edf0f3', padding: '7px 0', fontSize: 11 }}><span style={{ overflowWrap: 'anywhere' }}>{item.direction === 'inbox' ? '收到' : '发出'} · {item.package_uid} · {item.count} 条 · {item.status} · {item.signature_status === 'trusted' || item.signature_status === 'signed' ? '签名' : item.signature_status === 'signed_untrusted' ? '待信任' : '未签名'}</span>{item.direction === 'outbox' && <button style={buttonStyle} onClick={() => void collaborationSyncApi.download(item.package_uid).then(blob => { const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${item.package_uid}.pwshare`; anchor.click(); URL.revokeObjectURL(url) }).catch(error => setMessage(getErrorMessage(error)))}>下载</button>}{item.direction === 'inbox' && ['imported', 'partially_applied'].includes(item.status) && <button style={buttonStyle} disabled={busy || !databases.length} onClick={() => void handlePreviewApply(item.package_uid)}>预览主表应用</button>}<button style={buttonStyle} onClick={() => void handleShowRecords(item.package_uid)}>查看只读记录</button></div>)}
         {applyPackageUid && <div style={{ display: 'grid', gap: 8, marginTop: 12, borderTop: '1px solid #e2e8f0', paddingTop: 10 }}>
@@ -528,6 +568,6 @@ export default function CollaborationSyncPanel() {
         {selectedPackage && <div style={{ marginTop: 8 }}><div style={{ fontSize: 11, color: '#64748b', marginBottom: 4 }}>{selectedPackage} · 最多显示 1000 条</div><pre style={{ maxHeight: 240, overflow: 'auto', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 4, padding: 10, fontSize: 10 }}>{JSON.stringify(selectedRecords, null, 2)}</pre></div>}
       </div>
     </>}
-    {message && <div role="status" style={{ marginTop: 12, borderTop: '1px solid #e2e8f0', paddingTop: 8, fontSize: 12, color: '#334155', overflowWrap: 'anywhere' }}>{message}</div>}
+    {message && <div role="status" style={{ marginTop: 12, borderTop: '1px solid #e2e8f0', paddingTop: 8, fontSize: 12, color: '#334155', overflowWrap: 'anywhere' }}>{message}{governanceTargetDatabaseId && <button style={{ ...buttonStyle, marginLeft: 8, background: '#eef8f5', borderColor: '#65aa98' }} onClick={() => navigate(`/db/${governanceTargetDatabaseId}/governance`)}>到数据治理处理冲突</button>}</div>}
   </section>
 }

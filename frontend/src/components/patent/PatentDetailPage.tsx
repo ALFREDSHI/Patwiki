@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   patentService as patentApi,
   productService as productApi,
@@ -21,15 +22,21 @@ import type {
   PatentFamilyMember,
   PatentCitationItem,
   JsonObject,
+  AttachmentMeta,
 } from '../../types'
 import { getErrorMessage } from '../../lib/errors'
+import { patentText } from '../../lib/patentText'
 import { formatApiDate, formatApiDateTime, formatApiTime } from '../../lib/date'
+import { recordBrowse, recordEdit, type DailyHistoryInput } from '../../lib/dailyHistory'
 import PatentShareDialog from './PatentShareDialog'
 import PatentGraph from './PatentGraph'
 import CommentPanel from './CommentPanel'
 import AttachmentField from '../common/AttachmentField'
+import PatentFiguresField from '../common/PatentFiguresField'
 import ProjectRiskContextPanel from './ProjectRiskContextPanel'
 import Icon from '../common/Icon'
+import FieldVersionsPanel from './FieldVersionsPanel'
+import { customFieldApi } from '../../api'
 
 interface PatentDetailPageProps {
   patentId: number
@@ -38,7 +45,7 @@ interface PatentDetailPageProps {
   onOpenSidebar?: () => void
 }
 
-type Tab = 'basic' | 'project-info' | 'provenance' | 'technical' | 'ai' | 'custom' | 'relations' | 'comments'
+type Tab = 'basic' | 'figures' | 'project-info' | 'provenance' | 'technical' | 'ai' | 'custom' | 'relations' | 'comments' | 'versions'
 type PatentEditData = Partial<Patent> & { tag_ids?: number[]; project_ids?: number[] }
 
 const LEGAL_STATUS_LABELS: Record<string, string> = {
@@ -50,7 +57,23 @@ const PATENT_TYPE_LABELS: Record<string, string> = {
   invention: '发明', utility_model: '实用新型', design: '外观设计', pct: 'PCT',
 }
 
+/** 组装当日记录的写入数据，地址含查询串以便一键回到该详情页。 */
+function toHistoryInput(data: Patent): DailyHistoryInput {
+  const path = typeof window !== 'undefined' ? `${window.location.pathname}${window.location.search}` : undefined
+  return {
+    patentId: data.id,
+    title: data.title,
+    publicationNumber: data.publication_number,
+    applicationNumber: data.application_number,
+    applicant: data.applicant || data.assignee,
+    databaseId: data.database_id ?? null,
+    sourcePath: path,
+  }
+}
+
 export default function PatentDetailPage({ patentId, onBack, onPatentNavigate, onOpenSidebar }: PatentDetailPageProps) {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const publication = searchParams.get('publication') || undefined
   const [patent, setPatent] = useState<Patent | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -74,11 +97,13 @@ export default function PatentDetailPage({ patentId, onBack, onPatentNavigate, o
   const [identityLoading, setIdentityLoading] = useState(false)
   const [showShareDialog, setShowShareDialog] = useState(false)
   const [openCommentCount, setOpenCommentCount] = useState(0)
+  // 同一专利在一次停留中只记一次浏览（保存后重载不再重复累加）。
+  const recordedBrowseRef = useRef<number | null>(null)
 
   const loadPatent = useCallback(async () => {
     setLoading(true)
     try {
-      const data = await patentApi.get(patentId)
+      const data = await patentApi.get(patentId, publication)
       setPatent(data)
       setFormData(data)
     } catch (e) {
@@ -87,7 +112,7 @@ export default function PatentDetailPage({ patentId, onBack, onPatentNavigate, o
     } finally {
       setLoading(false)
     }
-  }, [patentId])
+  }, [patentId, publication])
 
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true)
@@ -163,11 +188,18 @@ export default function PatentDetailPage({ patentId, onBack, onPatentNavigate, o
     void loadAIValues()
   }, [loadAIValues, loadHistory, loadIdentity, loadMeta, loadPatent, loadCollaborationStates])
 
+  useEffect(() => {
+    if (!patent || recordedBrowseRef.current === patent.id) return
+    recordedBrowseRef.current = patent.id
+    recordBrowse(toHistoryInput(patent))
+  }, [patent])
+
   const handleSave = async () => {
     if (!patent) return
     setSaving(true)
     try {
       const updates: PatentEditData = { ...formData }
+      updates.document_number = patent.document_number
       // 移除只读字段
       delete updates.id
       delete updates.created_at
@@ -181,6 +213,7 @@ export default function PatentDetailPage({ patentId, onBack, onPatentNavigate, o
       delete updates.risk_level
       delete updates.risk_description
       await patentApi.update(patent.id, updates)
+      recordEdit(toHistoryInput({ ...patent, ...formData } as Patent))
       setEditing(false)
       await loadPatent()
       await loadHistory()
@@ -282,11 +315,18 @@ export default function PatentDetailPage({ patentId, onBack, onPatentNavigate, o
     )
   }
 
+  const figureList: AttachmentMeta[] = Array.isArray(patent.custom_fields?.patent_figures)
+    ? (patent.custom_fields?.patent_figures as unknown as AttachmentMeta[])
+    : []
+  const figureCount = figureList.filter(item => item?.is_image || item?.mime_type?.startsWith('image/')).length
+
   const tabs: { key: Tab; label: string }[] = [
     { key: 'basic', label: '基础著录' },
+    { key: 'figures', label: `专利附图${figureCount > 0 ? ` (${figureCount})` : ''}` },
     { key: 'relations', label: '同族与引用关系' },
     { key: 'project-info', label: '项目信息' },
     { key: 'provenance', label: `来源与审计${history.length > 0 ? ` (${history.length})` : ''}` },
+    { key: 'versions', label: '字段版本' },
     { key: 'technical', label: '技术信息' },
     { key: 'ai', label: 'AI 分析' },
     { key: 'custom', label: '自定义字段' },
@@ -296,6 +336,7 @@ export default function PatentDetailPage({ patentId, onBack, onPatentNavigate, o
   return (
     <>
       <div className="detail-page">
+      <div className="detail-sticky-header">
       {/* 顶部导航 */}
       <div className="detail-header">
         {onOpenSidebar && (
@@ -373,6 +414,10 @@ export default function PatentDetailPage({ patentId, onBack, onPatentNavigate, o
       </div>
 
       {/* Tab 导航 */}
+      {patent.publication_versions && Object.keys(patent.publication_versions).length > 0 && <div className="detail-tabs" role="tablist" aria-label="公开与授权版本">
+        {Object.entries(patent.publication_versions).map(([number, version]) => <button key={number} className={`detail-tab ${patent.document_number === number ? 'active' : ''}`} role="tab" aria-selected={patent.document_number === number} disabled={editing} onClick={() => { const next = new URLSearchParams(searchParams); next.set('publication', number); setSearchParams(next, { replace: true }) }}>{version.kind === 'grant' ? '授权' : '公开'} · {number}</button>)}
+      </div>}
+      {patent.version_data_available === false && <div className="workspace-error">此文献仅保留号码，尚无可恢复的版本著录信息。</div>}
       <div className="detail-tabs" role="tablist" aria-label="专利详情分区">
         {tabs.map(tab => (
           <button
@@ -386,12 +431,30 @@ export default function PatentDetailPage({ patentId, onBack, onPatentNavigate, o
           </button>
         ))}
       </div>
+      </div>
 
       {/* Tab 内容 */}
       <div className="detail-content">
         {activeTab === 'basic' && (
           <BasicInfoTab patent={patent} formData={formData} editing={editing} updateField={updateField} products={products} />
         )}
+        {activeTab === 'figures' && (
+          <div className="patent-detail-section">
+            <div className="patent-detail-section-heading">
+              <div>
+                <h3>专利附图</h3>
+                <p>Excel 批量导入、MCP 更新与手动上传的图片汇总于此；与项目信息中的图片附件相互独立。点击缩略图可放大并通过左右按钮切换查看。</p>
+              </div>
+            </div>
+            <PatentFiguresField
+              patentId={patent.id}
+              databaseId={patent.database_id ?? null}
+              value={patent.custom_fields?.patent_figures ?? null}
+              onChange={() => { void loadPatent() }}
+            />
+          </div>
+        )}
+        {activeTab === 'versions' && <FieldVersionsPanel patentId={patent.id} onChanged={() => { void patentApi.get(patent.id).then(data => { setPatent(data); setFormData(data) }); void loadHistory(); void loadIdentity() }} />}
         {activeTab === 'provenance' && (
           <div className="patent-provenance-layout">
             <section className="patent-detail-section">
@@ -877,21 +940,6 @@ function BasicInfoTab({ patent, formData, editing, updateField, products }: {
 
 // ============ 技术信息 Tab ============
 
-// 权利要求按编号解析：仅当超过一半的行以“1. / 2、”等形式开头时才视为编号列表，
-// 否则按原始段落展示，避免把普通文本误拆。
-function parseClaims(raw: string): Array<{ no: string | null; text: string }> | null {
-  if (!raw || !raw.trim()) return null
-  const lines = raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
-  if (lines.length === 0) return null
-  let numbered = 0
-  const parsed = lines.map(line => {
-    const match = line.match(/^(\d{1,3})[.、)．]\s*(.*)$/)
-    if (match) numbered += 1
-    return match ? { no: match[1], text: match[2] } : { no: null, text: line }
-  })
-  return numbered >= Math.ceil(parsed.length / 2) ? parsed : null
-}
-
 function TechnicalTab({ patent, formData, editing, updateField }: {
   patent: Patent
   formData: PatentEditData
@@ -905,11 +953,9 @@ function TechnicalTab({ patent, formData, editing, updateField }: {
   ]
   const storylineEmpty = storyline.every(item => !item.value || !String(item.value).trim())
   const claims = patent.claims || ''
-  const parsedClaims = editing ? null : parseClaims(claims)
-  const claimCount = parsedClaims ? parsedClaims.filter(item => item.no !== null).length : 0
   const summaryParts: string[] = []
   if (!storylineEmpty) summaryParts.push('技术主线')
-  if (claims.trim()) summaryParts.push(claimCount > 0 ? `${claimCount} 项权利要求` : '权利要求')
+  if (claims.trim()) summaryParts.push('权利要求文本')
   const headerSummary = summaryParts.length > 0 ? summaryParts.join(' · ') : '技术主线尚未记录'
 
   if (editing) {
@@ -1001,20 +1047,9 @@ function TechnicalTab({ patent, formData, editing, updateField }: {
         <section className="tech-claims">
           <div className="tech-claims-heading">
             <h3>权利要求</h3>
-            {claimCount > 0 && <span className="tech-claims-count">{claimCount} 项</span>}
+            {claims.trim() && <span className="tech-claims-count">完整文本</span>}
           </div>
-          {parsedClaims ? (
-            <ol className="tech-claim-list">
-              {parsedClaims.map((claim, index) => (
-                <li className="tech-claim" key={`${claim.no ?? 'x'}-${index}`}>
-                  <span className="tech-claim-no">{claim.no ?? ''}</span>
-                  <span className="tech-claim-text">{claim.text}</span>
-                </li>
-              ))}
-            </ol>
-          ) : (
-            <div className="tech-claims-raw">{claims}</div>
-          )}
+          <div className="tech-claims-raw">{patentText(claims)}</div>
         </section>
       ) : (
         <section className="tech-claims tech-claims-empty">
@@ -1143,7 +1178,7 @@ function AITab({ patent, aiFields, aiValues, onProcess, onOverride, onClearOverr
          <div className="detail-grid">
            {aiFields.map(field => {
              const stored = aiValues.find(item => item.field_key === field.key)
-             const value = stored?.value ?? aiData[field.key]
+             const value = stored?.value ?? aiData[field.key] ?? patent.custom_fields?.[field.key]
              const generatedValue = stored?.generated_value
              const hasValue = value !== null && value !== undefined && value !== ''
              const isOverridden = stored?.is_overridden === true
@@ -1239,7 +1274,10 @@ function CustomTab({ patent, editing, updateField }: {
   updateField: (key: keyof PatentEditData, value: unknown) => void
 }) {
   const customData = patent.custom_fields || {}
-  const keys = Object.keys(customData)
+  const [definitions, setDefinitions] = useState<CustomField[]>([])
+  useEffect(() => { void customFieldApi.list().then(setDefinitions).catch(() => setDefinitions([])) }, [])
+  const definitionsByKey = new Map(definitions.map(field => [field.key, field]))
+  const keys = Object.keys(customData).filter(key => !['attachments', 'patent_figures', 'family_members', 'cited_patents', 'citing_patents', 'original_links'].includes(key) && definitionsByKey.get(key)?.is_active !== false)
 
   return (
     <div>
@@ -1251,17 +1289,17 @@ function CustomTab({ patent, editing, updateField }: {
       ) : (
         <div className="detail-grid">
           {keys.map(key => (
-            <Field key={key} label={key}>
+            <Field key={key} label={definitionsByKey.get(key)?.name || key}>
               {editing ? (
                 <input
                   className="form-input"
-                  value={String(customData[key] ?? '')}
+                  value={formatAIValue(customData[key])}
                   onChange={e => {
                     const newData = { ...customData, [key]: e.target.value }
                     updateField('custom_fields', newData)
                   }}
                 />
-              ) : <div className="field-value">{String(customData[key] ?? '-')}</div>}
+              ) : <div className="field-value">{formatAIValue(customData[key]) || '-'}</div>}
             </Field>
           ))}
         </div>
@@ -1622,6 +1660,8 @@ const SOURCE_LABELS: Record<string, { label: string; color: string; bg: string }
   attachment: { label: '附件变更', color: '#475569', bg: '#e2e8f0' },
   external_sync: { label: 'MCP 外部同步', color: '#0f766e', bg: '#ccfbf1' },
   external_sync_update: { label: 'MCP 更新确认', color: '#0f766e', bg: '#ccfbf1' },
+  collaboration_sync: { label: '部门协同同步', color: '#047857', bg: '#d1fae5' },
+  department_publication: { label: '部门数据发布', color: '#047857', bg: '#d1fae5' },
 }
 
 function formatValue(v: string | null | undefined): string {
@@ -1651,18 +1691,17 @@ function HistoryTab({ patent, history, loading, onReload }: {
 
   type HistoryItem = { kind: 'entry'; history: PatentHistory } | { kind: 'import_batch'; key: string; histories: PatentHistory[] }
 
-  // 按日期分组；同一次导入只在时间线中显示一个可展开的摘要。
+  // 按日期分组；同一次文件导入或协同同步只显示一个可展开摘要。
   const groups: Record<string, HistoryItem[]> = {}
   const importItemsByKey = new Map<string, Extract<HistoryItem, { kind: 'import_batch' }>>()
   filtered.forEach(h => {
       const day = h.created_at ? formatApiDate(h.created_at) : '未知日期'
     if (!groups[day]) groups[day] = []
-    if (h.source !== 'import') {
+    if (h.import_batch_id == null && h.source !== 'import') {
       groups[day].push({ kind: 'entry', history: h })
       return
     }
-    // New batches have an immutable ID. Older records fall back to table + minute,
-    // so they remain compact without accidentally merging separate imports.
+    // New batches have an immutable ID. Older file imports fall back to source + minute.
     const fallbackTime = h.created_at ? h.created_at.slice(0, 16) : String(h.id)
     const batchKey = h.import_batch_id != null
       ? `batch:${h.import_batch_id}`
@@ -1676,7 +1715,7 @@ function HistoryTab({ patent, history, loading, onReload }: {
     batch.histories.push(h)
   })
 
-  const sourceOptions = ['all', 'manual', 'bulk', 'ai', 'import', 'api', 'attachment', 'external_sync', 'external_sync_update']
+  const sourceOptions = ['all', 'manual', 'bulk', 'ai', 'import', 'collaboration_sync', 'department_publication', 'api', 'attachment', 'external_sync', 'external_sync_update']
 
   return (
     <div>
@@ -1736,6 +1775,7 @@ function HistoryTab({ patent, history, loading, onReload }: {
                     const first = item.histories[0]
                     const rows = [...new Set(item.histories.map(history => history.source_row).filter((row): row is number => row != null))]
                     const sourceName = first.source_table_title || '未标注来源文件'
+                    const isSyncBatch = first.source === 'collaboration_sync' || first.source === 'department_publication'
                     const isExpanded = expandedImportBatches.has(item.key)
                     return (
                       <div key={item.key} className="history-import-batch" style={{ border: '1px solid #fde68a', borderRadius: 8, background: '#fffbeb' }}>
@@ -1751,9 +1791,9 @@ function HistoryTab({ patent, history, loading, onReload }: {
                           style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px', border: 'none', background: 'transparent', textAlign: 'left', cursor: 'pointer' }}
                         >
                           <span style={{ color: '#92400e', fontSize: 14 }}>{isExpanded ? '▾' : '▸'}</span>
-                          <span style={{ padding: '1px 8px', borderRadius: 10, fontSize: 11, background: '#fef3c7', color: '#92400e', fontWeight: 500 }}>导入批次</span>
-                          <strong className="history-import-batch-name" style={{ fontSize: 13, color: '#78350f', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sourceName}</strong>
-                          <span className="history-import-batch-count" style={{ marginLeft: 'auto', fontSize: 11, color: '#a16207', whiteSpace: 'nowrap' }}>
+                          <span style={{ padding: '1px 8px', borderRadius: 10, fontSize: 11, background: isSyncBatch ? '#d1fae5' : '#fef3c7', color: isSyncBatch ? '#047857' : '#92400e', fontWeight: 500 }}>{isSyncBatch ? '同步批次' : '导入批次'}</span>
+                          <strong className="history-import-batch-name" style={{ fontSize: 13, color: isSyncBatch ? '#065f46' : '#78350f', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sourceName}</strong>
+                          <span className="history-import-batch-count" style={{ marginLeft: 'auto', fontSize: 11, color: isSyncBatch ? '#047857' : '#a16207', whiteSpace: 'nowrap' }}>
                             {item.histories.length} 项字段变更{rows.length > 0 ? ` · 来源行 ${rows.join('、')}` : ''}
                           </span>
                           {first.source_import_note && <span style={{ fontSize: 11, color: '#92400e' }}>备注：{first.source_import_note}</span>}

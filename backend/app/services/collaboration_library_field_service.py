@@ -12,7 +12,7 @@ def plan_library_fields(db, package, database, record, patent):
     sources = (record.scope_json or {}).get("database_uids", [])
     fields = {key: value for key, value in payload.items() if key in PRIVATE_FIELDS and key != "custom_fields"}
     fields.update({f"custom_fields.{key}": value for key, value in (payload.get("custom_fields") or {}).items()
-        if key != "attachments"})
+        if key not in {"attachments", "patent_figures"}})
     plans, conflicts = [], []
     incoming = {(source, key): remote for source in sources for key, remote in fields.items()}
     for item in (record.field_provenance or {}).get("library_values", []):
@@ -39,7 +39,7 @@ def apply_library_fields(db, package, database, record, patent, plans, decisions
         choice = decisions.get((record.entity_uid, plan["conflict_key"]))
         if choice == "remote" or (state.has_overlay and state.local_value == plan["remote"]):
             state.has_overlay = False
-        if choice == "manual":
+        if choice in {"manual", "merge"}:
             state.local_value = details[(record.entity_uid, plan["conflict_key"])].value
             state.has_overlay = True
             state.editor_user_id = user_id

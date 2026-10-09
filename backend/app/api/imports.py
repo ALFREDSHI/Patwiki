@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, text, or_
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 import json
 import pandas as pd
 from io import BytesIO, StringIO
@@ -47,6 +47,7 @@ from app.models import (
     ImportBatch,
     ImportBatchStatus,
     ImportSourceRow,
+    ImportFieldGovernanceAudit,
     FieldObservation,
     Patent,
     PatentHistory,
@@ -66,6 +67,90 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 # 内存索引：import_id -> {"path": str, "filename": str, "created_at": float}
 TEMP_FILES: dict[str, dict] = {}
 TEMP_TTL = 6 * 3600  # 6小时过期
+
+
+def _session_path(import_id: str) -> Path:
+    try:
+        key = str(uuid.UUID(import_id))
+    except ValueError as exc:
+        raise BadRequestException("无效的导入会话") from exc
+    return SOURCE_DIR / f"{key}.json"
+
+
+def _read_session(import_id: str) -> dict:
+    path = _session_path(import_id)
+    if not path.exists():
+        raise NotFoundException("导入草稿不存在")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save_session(import_id: str, session: dict) -> None:
+    path = _session_path(import_id)
+    temp = path.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(session, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp, path)
+
+
+class ImportDraftRequest(BaseModel):
+    database_id: int
+    mapping: dict[str, str]
+    selected_sheet: str | None = None
+    product_id: int | None = None
+    project_id: int | None = None
+    view_id: int | None = None
+    import_note: str = ""
+
+
+@router.put("/import/sessions/{import_id}")
+def save_import_draft(import_id: str, req: ImportDraftRequest, db: Session = Depends(get_db)):
+    if not db.get(PatentDatabase, req.database_id):
+        raise NotFoundException("专利库不存在")
+    session = _read_session(import_id)
+    session["draft"] = req.model_dump()
+    session["updated_at"] = utc_now_naive().isoformat()
+    _save_session(import_id, session)
+    return {"saved": True}
+
+
+@router.get("/import/sessions")
+def list_import_drafts(database_id: int, db: Session = Depends(get_db)):
+    items = []
+    for path in SOURCE_DIR.glob("*.json"):
+        try:
+            session = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if (session.get("draft") or {}).get("database_id") != database_id:
+            continue
+        batch = db.get(ImportBatch, session["batch_id"]) if session.get("batch_id") else None
+        if batch and batch.status in {ImportBatchStatus.COMPLETED, ImportBatchStatus.ROLLED_BACK}:
+            continue
+        if session.get("preview"):
+            items.append({"import_id": session["preview"]["import_id"], "filename": session["info"]["filename"],
+                          "batch_id": session.get("batch_id"), "updated_at": session.get("updated_at")})
+    return sorted(items, key=lambda item: item.get("updated_at") or "", reverse=True)
+
+
+@router.get("/import/sessions/{import_id}")
+def get_import_draft(import_id: str, sheet_name: str | None = None, db: Session = Depends(get_db)):
+    session = _read_session(import_id)
+    if sheet_name and sheet_name != session["preview"].get("selected_sheet"):
+        content = Path(session["info"]["artifact_path"]).read_bytes()
+        filename = session["info"]["filename"]
+        if sheet_name not in ImportService.list_sheets(content, filename):
+            raise BadRequestException("工作表不存在")
+        frame, columns = ImportService.parse_excel(content, filename, sheet_name)
+        mapping, issues = ImportService.suggest_mapping(columns, db)
+        images = extract_embedded_images(content, filename, sheet_name, columns)
+        session["preview"].update(detected_columns=columns, total_rows=len(frame),
+            preview_rows=[{str(key): str(value) for key, value in row.to_dict().items()} for _, row in frame.head(3).iterrows()],
+            selected_sheet=sheet_name, suggested_mapping=mapping, mapping_issues=issues,
+            unmapped_columns=[column for column in columns if not mapping.get(column)],
+            embedded_image_count=len(images), embedded_images=[image.metadata(include_hash=False) for image in images])
+        _save_session(import_id, session)
+    session["preview"]["available_fields"] = get_all_fields_meta(db)
+    return {"preview": session["preview"], "draft": session.get("draft"), "batch_id": session.get("batch_id"),
+            "filename": session["info"]["filename"]}
 
 
 def _cleanup_expired():
@@ -134,12 +219,13 @@ class GovernanceRevertRequest(BaseModel):
 
 class ImportReviewItemRequest(BaseModel):
     observation_id: int
-    action: Literal["adopt", "keep_existing", "fill_empty", "ignore", "quarantine"]
+    action: Literal["adopt", "keep_existing", "fill_empty", "merge", "ignore", "quarantine"]
+    merge_value: Any = None
 
 
 class ImportReviewRequest(BaseModel):
     items: list[ImportReviewItemRequest] = []
-    default_action: Optional[Literal["adopt", "keep_existing", "fill_empty", "ignore", "quarantine"]] = None
+    default_action: Optional[Literal["adopt", "keep_existing", "fill_empty", "merge", "ignore", "quarantine"]] = None
     reviewed_by: str = "local-user"
     reason: Optional[str] = None
 
@@ -198,7 +284,7 @@ async def preview_import(
     databases = DatabaseService.list_databases(db)
     default_db = DatabaseService.get_default_database(db)
 
-    return {
+    preview = {
         "import_id": import_id,
         "detected_columns": columns,
         "preview_rows": preview_rows_list,
@@ -217,6 +303,9 @@ async def preview_import(
         "embedded_image_count": len(embedded_images),
         "embedded_images": [image.metadata(include_hash=False) for image in embedded_images],
     }
+    _save_session(import_id, {"info": TEMP_FILES[import_id], "preview": preview,
+                             "updated_at": utc_now_naive().isoformat()})
+    return preview
 
 
 def _apply_patent_update(patent: Patent, data: dict):
@@ -929,6 +1018,8 @@ def _legacy_confirm_import(
                                 source_timestamp=utc_now_naive(),
                             )
                             source_row.patent_id = current_patent.id
+                            from app.services.publication_version_service import save_document
+                            save_document(current_patent, patent_data, source="import", db=db, batch_id=batch.id)
                             source_row.resolution_status = "resolved"
                             unknown_in_row = _record_field_observations(
                                 db, batch, source_row, source_row.raw_row, columns, mapping,
@@ -1089,10 +1180,14 @@ def confirm_import(
     db: Session = Depends(get_db),
 ):
     """Create a reviewable import batch; Patent rows are not changed here."""
+    session = _read_session(req.import_id) if _session_path(req.import_id).exists() else {}
+    info = session.get("info") or TEMP_FILES.get(req.import_id) or {}
     temp_path = TEMP_DIR / f"{req.import_id}.bin"
+    if not temp_path.exists() and info.get("artifact_path"):
+        temp_path = Path(info["artifact_path"])
     if not temp_path.exists():
         raise BadRequestException("导入会话已过期或文件不存在，请重新上传文件")
-    info = TEMP_FILES.get(req.import_id) or {
+    info = info or {
         "path": str(temp_path),
         "filename": "upload.xlsx",
         "created_at": temp_path.stat().st_mtime,
@@ -1117,6 +1212,9 @@ def confirm_import(
         if not DatabaseService.get_database(db, database_id):
             raise BadRequestException(f"库不存在：{database_id}")
     mapping = {item.source_column: (item.target_field or "").strip() for item in req.field_mappings}
+    prior = db.get(ImportBatch, session["batch_id"]) if session.get("batch_id") else None
+    if prior and prior.status == ImportBatchStatus.COMPLETED:
+        raise BadRequestException("该导入已完成，请重新上传新文件")
     try:
         result = stage_import(
             db,
@@ -1135,10 +1233,20 @@ def confirm_import(
         )
         result["database_id"] = database_id
         result["unknown_columns"] = [column for column, target in mapping.items() if not target and target != IMPORT_SKIP_FIELD]
+        if prior and prior.status == ImportBatchStatus.REVIEW_REQUIRED:
+            prior.status = ImportBatchStatus.ROLLED_BACK
+            prior.review_config = {**(prior.review_config or {}), "superseded_by": result["batch_id"]}
+            db.commit()
+        if session:
+            session["batch_id"] = result["batch_id"]
+            session["draft"] = {"database_id": database_id, "mapping": mapping, "selected_sheet": req.sheet_name,
+                                "product_id": req.product_id, "project_id": req.project_id, "view_id": req.view_id,
+                                "import_note": req.import_note or ""}
+            _save_session(req.import_id, session)
         return result
     finally:
         info = TEMP_FILES.pop(req.import_id, None)
-        if info and os.path.exists(info["path"]):
+        if info and session.get("batch_id") and os.path.exists(info["path"]):
             try:
                 os.remove(info["path"])
             except OSError:
@@ -1149,10 +1257,14 @@ def confirm_import(
 def get_import_batch_changes(
     batch_id: int,
     only_differences: bool = Query(False),
+    only_conflicts: bool = Query(False),
+    offset: int = Query(0, ge=0),
     limit: int = Query(2000, ge=1, le=10000),
     db: Session = Depends(get_db),
 ):
-    return list_batch_changes(db, batch_id, only_differences=only_differences, limit=limit)
+    return list_batch_changes(
+        db, batch_id, only_differences=only_differences, only_conflicts=only_conflicts, offset=offset, limit=limit,
+    )
 
 
 @router.post("/import/batches/{batch_id}/review")
@@ -1202,7 +1314,7 @@ def list_import_batches(
             query = query.filter(ImportBatch.status == ImportBatchStatus(status))
         except ValueError as exc:
             raise BadRequestException(f"不支持的导入状态：{status}") from exc
-    if database_id is not None:
+    if database_id is not None and not db.query(PatentDatabase).filter(PatentDatabase.id == database_id, PatentDatabase.is_default.is_(True)).first():
         # ImportBatch deliberately keeps database scope in review_config so
         # older databases remain schema-compatible. Filter at the API
         # boundary so the history screen never mixes libraries.
@@ -1216,6 +1328,60 @@ def get_import_batch(batch_id: int, db: Session = Depends(get_db)):
     if not batch:
         raise NotFoundException("导入批次不存在")
     return batch
+
+
+@router.get("/import/batches/{batch_id}/records")
+def get_import_records(batch_id: int, offset: int = Query(0, ge=0),
+                       limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
+    batch = db.get(ImportBatch, batch_id)
+    if not batch:
+        raise NotFoundException("导入批次不存在")
+    query = db.query(ImportSourceRow).filter(ImportSourceRow.import_batch_id == batch_id)
+    total = query.count()
+    rows = query.order_by(ImportSourceRow.source_row, ImportSourceRow.id).offset(offset).limit(limit).all()
+    items = []
+    for row in rows:
+        observations = db.query(FieldObservation).filter(FieldObservation.source_row_id == row.id,
+            FieldObservation.canonical_field_key.in_(["application_number", "publication_number", "grant_number"])).all()
+        numbers = {item.canonical_field_key: item.raw_value for item in observations if item.raw_value}
+        patent = db.get(Patent, row.patent_id) if row.patent_id else None
+        items.append({"source_row": row.source_row, "patent_id": patent.id if patent and not patent.deleted_at else None,
+            "title": patent.title if patent else None, "status": row.resolution_status,
+            "reason": row.resolution_reason, "numbers": numbers,
+            "publication_number": numbers.get("publication_number") or numbers.get("grant_number") or (patent.publication_number if patent else None),
+            "application_number": numbers.get("application_number") or (patent.application_number if patent else None)})
+    if not total:
+        # Older imports and collaboration batches may predate source-row lineage.
+        ids = set(batch.created_patent_ids or [])
+        ids.update((batch.review_config or {}).get("involved_patent_ids") or [])
+        ids.update(id_ for (id_,) in db.query(PatentHistory.patent_id).filter(PatentHistory.import_batch_id == batch_id).distinct())
+        ids.update(id_ for (id_,) in db.query(Patent.id).filter(Patent.source_batch_id == batch_id))
+        patents = db.query(Patent).filter(Patent.id.in_(ids)).order_by(Patent.id).all()
+        total = len(patents)
+        items = [{"source_row": patent.source_row, "patent_id": patent.id if not patent.deleted_at else None,
+                  "title": patent.title, "status": "历史关联", "numbers": {},
+                  "publication_number": patent.publication_number or patent.grant_number,
+                  "application_number": patent.application_number} for patent in patents[offset:offset + limit]]
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
+
+
+@router.post("/import/batches/{batch_id}/resume")
+async def resume_import_batch(batch_id: int, db: Session = Depends(get_db)):
+    batch = db.get(ImportBatch, batch_id)
+    if not batch or batch.status != ImportBatchStatus.REVIEW_REQUIRED or (batch.review_config or {}).get("batch_kind") == "collaboration_sync":
+        raise BadRequestException("该批次无法返回文件映射")
+    if not batch.artifact_path or not Path(batch.artifact_path).exists():
+        raise BadRequestException("历史批次原始文件不存在")
+    preview = await preview_import(UploadFile(filename=batch.filename, file=BytesIO(Path(batch.artifact_path).read_bytes())),
+                                   batch.worksheet_name, db)
+    session = _read_session(preview["import_id"])
+    config = batch.review_config or {}
+    session["draft"] = {"database_id": config.get("database_id"), "mapping": batch.mapping_config or {},
+                        "selected_sheet": batch.worksheet_name, "product_id": config.get("product_id"),
+                        "project_id": config.get("project_id"), "view_id": config.get("view_id"), "import_note": batch.import_note or ""}
+    session["batch_id"] = batch.id
+    _save_session(preview["import_id"], session)
+    return {"import_id": preview["import_id"]}
 
 
 def _unmapped_observation_query(
@@ -1394,6 +1560,7 @@ def decide_import_observation(
     updated_items = []
 
     for target in targets:
+        source_row = source_rows.get(target.source_row_id)
         before_field_resolution = target.field_resolution
         before_final_decision = target.final_decision
         before_proposed_action = target.proposed_action
@@ -1442,6 +1609,27 @@ def decide_import_observation(
                         changed_values += 1
                         patent_value_after = new_value
                         patent_value_changed = True
+                else:
+                    old_value = new_value = current
+                from app.services.import_governance_service import record_import_field_change
+                record_import_field_change(
+                    db,
+                    patent=patent,
+                    field_key=target_field,
+                    old_value=old_value,
+                    incoming_value=candidate,
+                    final_value=new_value,
+                    database_id=(batch.review_config or {}).get("database_id"),
+                    source_kind="governance_import",
+                    source_label=batch.source_table_title or batch.filename,
+                    source_reference=f"batch:{batch.id}:observation:{target.id}",
+                    import_batch_id=batch.id,
+                    source_row=source_row.source_row if source_row else None,
+                    source_field_name=target.source_field_name,
+                    resolution="use_incoming" if should_adopt or should_fill else "keep_existing",
+                    decided_by=target.decided_by,
+                    reason=req.reason or ("治理映射：采用来源值" if should_adopt or should_fill else "治理映射：保留现有值"),
+                )
 
         db.add(GovernanceDecision(
             observation_id=target.id,
@@ -1696,6 +1884,73 @@ def list_unmapped_observations(
         "offset": offset,
         "limit": limit,
         "items": [_observation_to_dict(observation, source_row, batch) for observation, source_row, batch in rows],
+    }
+
+
+@router.get("/import/governance/audits")
+def list_import_governance_audits(
+    database_id: Optional[int] = None,
+    field_key: Optional[str] = None,
+    source_kind: Optional[str] = None,
+    q: Optional[str] = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(30, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    query = db.query(ImportFieldGovernanceAudit, Patent).outerjoin(
+        Patent, Patent.id == ImportFieldGovernanceAudit.patent_id,
+    )
+    if database_id is not None:
+        query = query.filter(ImportFieldGovernanceAudit.database_id == database_id)
+    if field_key:
+        query = query.filter(ImportFieldGovernanceAudit.field_key.ilike(f"%{field_key.strip()}%"))
+    if source_kind:
+        query = query.filter(ImportFieldGovernanceAudit.source_kind == source_kind)
+    if q and q.strip():
+        term = f"%{q.strip()}%"
+        query = query.filter(or_(
+            Patent.title.ilike(term),
+            ImportFieldGovernanceAudit.patent_title.ilike(term),
+            Patent.application_number.ilike(term),
+            ImportFieldGovernanceAudit.application_number.ilike(term),
+            Patent.publication_number.ilike(term),
+            ImportFieldGovernanceAudit.publication_number.ilike(term),
+            Patent.grant_number.ilike(term),
+            ImportFieldGovernanceAudit.field_key.ilike(term),
+            ImportFieldGovernanceAudit.source_label.ilike(term),
+            ImportFieldGovernanceAudit.source_field_name.ilike(term),
+        ))
+    total = query.count()
+    rows = query.order_by(
+        ImportFieldGovernanceAudit.created_at.desc(),
+        ImportFieldGovernanceAudit.id.desc(),
+    ).offset(offset).limit(limit).all()
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "items": [{
+            "id": audit.id,
+            "patent_id": audit.patent_id,
+            "patent_uid": audit.patent_uid,
+            "patent_title": (patent.title if patent else None) or audit.patent_title,
+            "application_number": (patent.application_number if patent else None) or audit.application_number,
+            "publication_number": (patent.publication_number if patent else None) or audit.publication_number,
+            "field_key": audit.field_key,
+            "old_value": audit.old_value,
+            "incoming_value": audit.incoming_value,
+            "final_value": audit.final_value,
+            "source_kind": audit.source_kind,
+            "source_label": audit.source_label,
+            "source_reference": audit.source_reference,
+            "import_batch_id": audit.import_batch_id,
+            "source_row": audit.source_row,
+            "source_field_name": audit.source_field_name,
+            "resolution": audit.resolution,
+            "decided_by": audit.decided_by,
+            "reason": audit.reason,
+            "created_at": audit.created_at.isoformat() if audit.created_at else None,
+        } for audit, patent in rows],
     }
 
 

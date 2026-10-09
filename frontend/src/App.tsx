@@ -5,13 +5,12 @@ import PatentListPage from './components/patent/PatentListPage'
 import PatentDetailPage from './components/patent/PatentDetailPage'
 import StatsPage from './components/patent/StatsPage'
 import SettingsPage from './components/settings/SettingsPage'
-import FieldSettingsPage from './components/settings/FieldSettingsPage'
 import SharingPage from './components/settings/SharingPage'
 import AgentAnalysisPage from './components/analytics/AgentAnalysisPage'
 import ImportModal from './components/import/ImportModal'
+import { TableDropdownScope } from './components/common/TableDropdown'
 import ImportHistoryPage from './components/import/ImportHistoryPage'
 import ImportGovernancePage from './components/import/ImportGovernancePage'
-import AITaskMonitor from './components/ai/AITaskMonitor'
 import AICapabilityCenter from './components/ai/AICapabilityCenter'
 import ManagementPage from './components/management/ManagementPage'
 import ProjectWikiPage from './components/management/ProjectWikiPage'
@@ -19,6 +18,8 @@ import AttachmentLibraryPage from './components/management/AttachmentLibraryPage
 import PublicPatentSharePage from './components/patent/PublicPatentSharePage'
 import { SharedFormView } from './components/views/FormView'
 import Icon from './components/common/Icon'
+import BrandLogo from './components/common/BrandLogo'
+import LegalFooter from './components/common/LegalFooter'
 import { customFieldApi, tagApi, projectApi, databaseApi, viewApi } from './api'
 import { useAppStore } from './store'
 import './index.css'
@@ -303,12 +304,12 @@ function WorkspaceApp() {
     automation: '自动化规则',
     'external-sync': '外部数据同步',
     settings: '系统设置',
-    fields: '字段管理',
+    fields: '自定义字段与AI抽取',
     management: '管理台',
     'project-wiki': '项目 Wiki',
     attachments: '附件库',
     'ai-center': 'AI 能力中心',
-    'ai-tasks': 'AI 任务',
+    'ai-tasks': 'AI抽取任务记录',
     'agent-analysis': '智能分析',
     sharing: '协作与权限',
     'import-history': '导入历史',
@@ -316,7 +317,7 @@ function WorkspaceApp() {
   }
   return (
     <div className={`app-container ${sidebarOpen ? 'sidebar-open' : ''} ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
-      {initializing && <div className="app-initializing" role="status" aria-live="polite"><div className="app-initializing-mark"><Icon name="sparkles" size={22} /></div><div className="app-initializing-title">正在初始化 PatWiki</div><div className="app-initializing-subtitle">正在准备数据库、视图和 AI 能力</div><div className="app-initializing-progress"><span /></div></div>}
+      {initializing && <div className="app-initializing" role="status" aria-live="polite"><div className="app-initializing-mark"><BrandLogo size={64} decorative /></div><div className="app-initializing-title">正在初始化 PatWiki</div><div className="app-initializing-subtitle">正在准备数据库、视图和 AI 能力</div><div className="app-initializing-progress"><span /></div></div>}
       <Sidebar
         currentPage={currentPage}
         onNavigate={handleNavigate}
@@ -343,14 +344,14 @@ function WorkspaceApp() {
             <Route path="db/:databaseId/automation" element={<DatabaseRouteScope><AICapabilityCenter initialTab="mcp" /></DatabaseRouteScope>} />
             <Route path="db/:databaseId/external-sync" element={<DatabaseRouteScope><AICapabilityCenter initialTab="mcp" /></DatabaseRouteScope>} />
             <Route path="db/:databaseId/settings" element={<DatabaseRouteScope><SettingsPage /></DatabaseRouteScope>} />
-            <Route path="db/:databaseId/fields" element={<DatabaseRouteScope><FieldSettingsPage /></DatabaseRouteScope>} />
+            <Route path="db/:databaseId/fields" element={<DatabaseRouteScope><AICapabilityCenter initialTab="fields" /></DatabaseRouteScope>} />
             <Route path="db/:databaseId/management" element={<DatabaseRouteScope><ManagementPage /></DatabaseRouteScope>} />
             <Route path="db/:databaseId/attachments" element={<DatabaseRouteScope><AttachmentLibraryPage /></DatabaseRouteScope>} />
             <Route path="db/:databaseId/ai-center" element={<DatabaseRouteScope><AICapabilityCenter /></DatabaseRouteScope>} />
             <Route path="db/:databaseId/sharing" element={<DatabaseRouteScope><SharingPage /></DatabaseRouteScope>} />
             <Route path="db/:databaseId/import-history" element={<DatabaseRouteScope><ImportHistoryPage /></DatabaseRouteScope>} />
             <Route path="db/:databaseId/governance" element={<DatabaseRouteScope><ImportGovernancePage /></DatabaseRouteScope>} />
-            <Route path="db/:databaseId/ai-tasks" element={<DatabaseRouteScope><AITaskMonitor /></DatabaseRouteScope>} />
+            <Route path="db/:databaseId/ai-tasks" element={<DatabaseRouteScope><AICapabilityCenter initialTab="tasks" /></DatabaseRouteScope>} />
             <Route path="db/:databaseId/agent-analysis" element={<DatabaseRouteScope><AgentAnalysisPage /></DatabaseRouteScope>} />
             <Route path="patents" element={<PatentListPage onPatentClick={handlePatentClick} viewId={isGlobalMasterTable ? null : currentViewId} onOpenImport={() => setShowImport(true)} onOpenSidebar={() => setSidebarOpen(true)} />} />
             <Route path="patents/:patentId" element={<PatentDetailRoute onOpenSidebar={() => setSidebarOpen(true)} />} />
@@ -359,7 +360,7 @@ function WorkspaceApp() {
             <Route path="automation" element={<AICapabilityCenter initialTab="mcp" />} />
             <Route path="external-sync" element={<AICapabilityCenter initialTab="mcp" />} />
             <Route path="settings" element={<SettingsPage />} />
-            <Route path="fields" element={<FieldSettingsPage />} />
+            <Route path="fields" element={<AICapabilityCenter initialTab="fields" />} />
             <Route path="management" element={<ManagementPage />} />
             <Route path="attachments" element={<AttachmentLibraryPage />} />
             <Route path="projects/:projectId" element={<ProjectWikiPage />} />
@@ -367,11 +368,12 @@ function WorkspaceApp() {
             <Route path="sharing" element={<SharingPage />} />
             <Route path="import-history" element={<ImportHistoryPage />} />
             <Route path="governance" element={<ImportGovernancePage />} />
-            <Route path="ai-tasks" element={<AITaskMonitor />} />
+            <Route path="ai-tasks" element={<AICapabilityCenter initialTab="tasks" />} />
             <Route path="agent-analysis" element={<AgentAnalysisPage />} />
             <Route path="*" element={<Navigate to="/patents" replace />} />
           </Routes>
         </div>
+        <LegalFooter />
       </div>
 
       {showImport && (
@@ -400,7 +402,7 @@ function App() {
       </Routes>
     )
   }
-  return <WorkspaceApp />
+  return <TableDropdownScope><WorkspaceApp /></TableDropdownScope>
 }
 
 export default App

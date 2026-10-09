@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
 import uuid
 from typing import Any
 
@@ -120,12 +121,16 @@ class SyncService:
 
     @staticmethod
     def record_dict(record: SyncRecord) -> dict[str, Any]:
+        patent = record.patent
+        snapshot = record.snapshot
         return {
             "id": record.id,
             "sync_run_id": record.sync_run_id,
             "external_record_id": record.external_record_id,
             "record_kind": record.record_kind,
             "patent_id": record.patent_id,
+            "patent_number": (patent.publication_number if patent else None),
+            "patent_title": (patent.title if patent else None),
             "external_snapshot_id": record.external_snapshot_id,
             "identity_status": record.identity_status,
             "identity_candidate_patent_ids": record.identity_candidate_patent_ids or [],
@@ -133,6 +138,7 @@ class SyncService:
             "idempotency_key": record.idempotency_key,
             "error_code": record.error_code,
             "error_message": record.error_message,
+            "snapshot_payload": (snapshot.payload_json if snapshot else None),
             "created_at": record.created_at.isoformat() if record.created_at else None,
         }
 
@@ -266,6 +272,9 @@ class SyncService:
         patent = db.query(Patent).filter(Patent.id == patent_id).first()
         if not patent:
             return None
+        if patent.publication_number:
+            from app.services.patent_identity_service import normalize_publication_number
+            return ProviderIdentifier(identifier_type="publication", raw_value=normalize_publication_number(patent.publication_number) or patent.publication_number, jurisdiction_code=patent.country)
         identifier = db.query(PatentIdentifier).filter(
             PatentIdentifier.patent_id == patent_id,
             PatentIdentifier.is_primary == True,
@@ -361,7 +370,8 @@ class SyncService:
                             raise ValueError("跟踪的专利已不存在")
                         if not identifier:
                             raise ValueError("该专利没有可用于外部检索的申请号、公开号或授权号")
-                        record = connector.fetch_patent(identifier)
+                        from app.services.sync_update_service import SyncUpdateService
+                        record = SyncUpdateService._fetch_record(connector, patent, payload.get("update_fields"))
                         process_record(db, run, subscription, record)
                         refreshed_patent = db.query(Patent).filter(Patent.id == tracked.patent_id).first()
                         current_status = str(getattr(refreshed_patent.legal_status, "value", refreshed_patent.legal_status) or "unknown") if refreshed_patent else "unknown"
@@ -429,6 +439,9 @@ class SyncService:
                         next_cursor = page.next_cursor
                         break
                     for record in page.records:
+                        fetch_fields = getattr(connector, "fetch_patent_fields", None)
+                        if callable(fetch_fields) and payload.get("update_fields") and record.identifiers:
+                            record = fetch_fields(record.identifiers[0], set(payload["update_fields"]))
                         process_record(db, run, subscription, record)
                     next_cursor = page.next_cursor
                     cursor.cursor = next_cursor
@@ -493,7 +506,7 @@ class SyncService:
         return results
 
     @classmethod
-    def refresh_patent(cls, db: Session, connector: ConnectorDefinition, identifier: ProviderIdentifier, database_id: int, review_policy: str = "safe_auto_apply") -> SyncRun:
+    def refresh_patent(cls, db: Session, connector: ConnectorDefinition, identifier: ProviderIdentifier, database_id: int, review_policy: str = "safe_auto_apply", fields: list[str] | None = None) -> SyncRun:
         run = SyncRun(
             connector_id=connector.id,
             database_id=database_id,
@@ -507,8 +520,10 @@ class SyncService:
         db.refresh(run)
         try:
             runtime_connector = get_connector(connector)
-            record = runtime_connector.fetch_patent(identifier)
-            transient = SyncSubscription(database_id=database_id, connector_id=connector.id, name="manual-refresh", review_policy=review_policy)
+            fetch_fields = getattr(runtime_connector, "fetch_patent_fields", None)
+            record = fetch_fields(identifier, set(fields)) if fields and callable(fetch_fields) else runtime_connector.fetch_patent(identifier)
+            transient = SyncSubscription(database_id=database_id, connector_id=connector.id, name="manual-refresh", review_policy=review_policy,
+                                         scope_json={"update_fields": fields} if fields else {})
             process_record(db, run, transient, record)
             flag_modified(run, "counts_json")
             run.status = "succeeded"
@@ -532,27 +547,98 @@ class SyncService:
 
     @staticmethod
     def decide_observation(db: Session, observation: ExternalFactObservation, decision: str, decided_by: str, reason: str | None = None) -> ExternalFactObservation:
-        from app.services.sync_support import SAFE_EXTERNAL_FIELDS
+        from app.services.sync_support import REVIEWABLE_EXTERNAL_FIELDS
         if decision not in {"accepted", "rejected"}:
             raise ValueError("decision must be accepted or rejected")
+        sync_run = db.get(SyncRun, observation.sync_run_id)
+        audit_database_id = sync_run.database_id if sync_run else None
         if decision == "accepted":
             if not observation.patent_id:
                 raise ValueError("没有关联专利的观察不能直接接受")
             patent = db.query(Patent).filter(Patent.id == observation.patent_id).one()
-            if observation.canonical_field_key not in SAFE_EXTERNAL_FIELDS:
+            if observation.canonical_field_key not in REVIEWABLE_EXTERNAL_FIELDS:
                 raise ValueError("该字段不允许外部同步直接写入")
-            before = serialize_value(getattr(patent, observation.canonical_field_key, None))
-            value = date_value(observation.candidate_value) if observation.canonical_field_key.endswith("_date") else observation.candidate_value
-            setattr(patent, observation.canonical_field_key, value)
-            db.add(PatentHistory(
+            if observation.canonical_field_key in {"family_members", "cited_patents", "citing_patents"}:
+                from app.services.relation_service import apply_external_relation
+                before_value = (patent.custom_fields or {}).get(observation.canonical_field_key)
+                value = observation.candidate_value
+                apply_external_relation(db, patent, observation.canonical_field_key, value,
+                                        audit_database_id, decided_by, source="external_sync_review", record_audit=False)
+            elif observation.canonical_field_key.startswith("mcp_"):
+                before_value = (patent.custom_fields or {}).get(observation.canonical_field_key)
+                try:
+                    value = json.loads(observation.candidate_value or "null")
+                except (TypeError, json.JSONDecodeError):
+                    value = observation.candidate_value
+                custom_fields = dict(patent.custom_fields or {})
+                custom_fields[observation.canonical_field_key] = value
+                patent.custom_fields = custom_fields
+            else:
+                before_value = getattr(patent, observation.canonical_field_key, None)
+                value = date_value(observation.candidate_value) if observation.canonical_field_key.endswith("_date") else observation.candidate_value
+                setattr(patent, observation.canonical_field_key, value)
+            before = serialize_value(before_value)
+            if observation.canonical_field_key not in {"family_members", "cited_patents", "citing_patents"}:
+                db.add(PatentHistory(
                 patent_id=patent.id,
                 field_key=observation.canonical_field_key,
                 old_value=before,
                 new_value=observation.candidate_value,
                 source="external_sync_review",
                 changed_by=decided_by,
-            ))
+                ))
+            from app.services.import_governance_service import record_import_field_change
+            record_import_field_change(
+                db,
+                patent=patent,
+                field_key=observation.canonical_field_key,
+                old_value=before_value,
+                incoming_value=value,
+                final_value=value,
+                database_id=audit_database_id,
+                source_kind="external_sync",
+                source_label=f"外部同步运行 #{observation.sync_run_id}",
+                source_reference=f"observation:{observation.id}",
+                decided_by=decided_by,
+                reason=reason or "用户接受外部同步观察",
+            )
             observation.current_value = before
+        elif observation.patent_id:
+            patent = db.query(Patent).filter(Patent.id == observation.patent_id).one_or_none()
+            if patent:
+                field_key = observation.canonical_field_key
+                current = (
+                    (patent.custom_fields or {}).get(field_key)
+                    if field_key.startswith("mcp_")
+                    else getattr(patent, field_key, None)
+                )
+                raw_candidate = observation.candidate_value
+                if field_key.startswith("mcp_"):
+                    try:
+                        candidate = json.loads(raw_candidate or "null")
+                    except (TypeError, json.JSONDecodeError):
+                        candidate = raw_candidate
+                else:
+                    candidate = raw_candidate
+                if field_key.endswith("_date"):
+                    candidate = date_value(candidate)
+                from app.services.import_governance_service import record_import_field_change
+                record_import_field_change(
+                    db,
+                    patent=patent,
+                    field_key=field_key,
+                    old_value=current,
+                    incoming_value=candidate,
+                    final_value=current,
+                    database_id=audit_database_id,
+                    source_kind="external_sync",
+                    source_label=f"外部同步运行 #{observation.sync_run_id}",
+                    source_reference=f"observation:{observation.id}",
+                    resolution="keep_existing",
+                    decided_by=decided_by,
+                    reason=reason or "用户拒绝外部同步观察，保留现有值",
+                )
+                observation.current_value = serialize_value(current)
         observation.decision = decision
         observation.decision_reason = reason
         observation.decided_by = decided_by

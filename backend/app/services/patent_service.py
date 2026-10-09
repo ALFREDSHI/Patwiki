@@ -14,6 +14,7 @@ from app.models import (
     PatentViewMembership,
     FieldObservation,
     ProjectRole, RiskLevel, RelationType, DocumentRole,
+    ImportBatch,
 )
 from app.models.collaboration_sync import SyncTombstone
 from app.schemas.schemas import PatentCreate, PatentUpdate
@@ -54,7 +55,10 @@ SEARCH_TEXT_FIELDS = (
     "risk_description", "risk_level", "module", "application_status",
     "scope_description", "notes", "search_vector",
 )
-FILTER_OPERATORS = {"contains", "eq", "starts_with", "ends_with", "is_empty", "is_not_empty"}
+FILTER_OPERATORS = {"contains", "eq", "starts_with", "ends_with", "is_empty", "is_not_empty", "in"}
+# 值清单筛选用到的“空值”占位符：前端勾选“(空)”时以该 token 表达，
+# 后端翻译为 NULL 或空字符串，避免把真正的空串与用户勾选混淆。
+FILTER_EMPTY_TOKEN = "__EMPTY__"
 
 # These fields remain readable for legacy views, but structured RiskCase and
 # RiskAssessmentVersion are now the only supported write path.
@@ -112,6 +116,33 @@ def _parse_filter_condition(filter_value: Any) -> tuple[str, Any] | None:
     return "contains", filter_value
 
 
+def _text_match_candidates(value: Any) -> set[str]:
+    """标准化单个文本匹配值，兼容布尔列在 SQLite 中的 "1"/"0" 存储。"""
+    lowered = str(value).strip().lower()
+    candidates = {lowered}
+    if lowered in ("true", "1"):
+        candidates.update(("true", "1"))
+    elif lowered in ("false", "0"):
+        candidates.update(("false", "0"))
+    return candidates
+
+
+def _split_in_values(value: Any) -> tuple[list[Any], bool]:
+    """拆分值清单为 (非空值列表, 是否包含空值)。
+
+    None 或 FILTER_EMPTY_TOKEN 视为“勾选了空值”，其余按原值返回。
+    """
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    non_empty: list[Any] = []
+    include_empty = False
+    for item in values:
+        if item is None or str(item) == FILTER_EMPTY_TOKEN:
+            include_empty = True
+        else:
+            non_empty.append(item)
+    return non_empty, include_empty
+
+
 def _apply_filter_expression(expression, operator: str, value: Any):
     """Build one Excel-style predicate for a SQL column or JSON expression."""
     text_expression = expression.cast(String)
@@ -121,6 +152,30 @@ def _apply_filter_expression(expression, operator: str, value: Any):
         return and_(expression.isnot(None), text_expression != "")
     if value is None:
         return None
+    if operator == "in":
+        # Excel 式“值清单”多选：value 为勾选值数组。空值用 FILTER_EMPTY_TOKEN
+        # 表达，翻译为 NULL/空串，与其他值取并集。
+        if not isinstance(value, (list, tuple, set)):
+            value = [value]
+        candidates: set[str] = set()
+        include_empty = False
+        for item in value:
+            if item is None:
+                include_empty = True
+                continue
+            item_text = str(item)
+            if item_text == FILTER_EMPTY_TOKEN:
+                include_empty = True
+                continue
+            candidates.update(_text_match_candidates(item))
+        predicates = []
+        if candidates:
+            predicates.append(func.lower(text_expression).in_(list(candidates)))
+        if include_empty:
+            predicates.append(or_(expression.is_(None), text_expression == ""))
+        if not predicates:
+            return None
+        return or_(*predicates)
     value_text = str(value)
     if operator == "contains":
         return text_expression.ilike(f"%{value_text}%")
@@ -132,13 +187,7 @@ def _apply_filter_expression(expression, operator: str, value: Any):
         # SQLite 把布尔列存成整数，cast 成文本后是 "1"/"0"；而前端可能传
         # true/false，str() 后是 "True"/"False"。统一按布尔语义匹配，避免
         # {"has_risk": {"eq": true}} 这类筛选永远匹配不到任何行。
-        lowered = value_text.strip().lower()
-        candidates = {lowered}
-        if lowered in ("true", "1"):
-            candidates.update(("true", "1"))
-        elif lowered in ("false", "0"):
-            candidates.update(("false", "0"))
-        return func.lower(text_expression).in_(list(candidates))
+        return func.lower(text_expression).in_(list(_text_match_candidates(value_text)))
     return None
 
 
@@ -193,6 +242,14 @@ class PatentService:
     @staticmethod
     def restore_history(db: Session, patent: Patent, history: PatentHistory) -> None:
         field_key = history.field_key
+        if field_key.startswith("publication_versions."):
+            from app.services.import_review_service import restore_value, current_value
+            old = current_value(patent, field_key)
+            restore_value(patent, field_key, history.old_value)
+            db.add(PatentHistory(patent_id=patent.id, field_key=field_key,
+                field_display_name=history.field_display_name, old_value=old,
+                new_value=history.old_value, source="rollback", changed_by="local-user"))
+            return
         value = PatentService._history_value_for_field(field_key, history.old_value)
         if field_key.startswith("custom_fields."):
             key = field_key.split(".", 1)[1]
@@ -208,6 +265,13 @@ class PatentService:
             setattr(patent, field_key, value)
         else:
             raise BadRequestException(f"字段 {field_key} 不支持回滚")
+        from app.services.field_policy_service import validate_field_value
+        key = field_key.removeprefix("custom_fields.")
+        meta = next((field for field in get_all_fields_meta(db) if field["key"] == key), None)
+        if meta:
+            validate_field_value(meta, value)
+        from app.services.patent_identity_service import ensure_patent_identifiers
+        ensure_patent_identifiers(db, patent, source_system="rollback")
         if _is_value_changed(old, value):
             db.add(PatentHistory(patent_id=patent.id, field_key=field_key,
                 field_display_name=history.field_display_name, old_value=_stringify_value(old),
@@ -270,7 +334,21 @@ class PatentService:
         filters: Optional[dict[str, Any]] = None,
         group_by_family: bool = False,
         group_order_fields: Optional[list[tuple[str, str]]] = None,
+        family_country: Optional[str] = None,
+        family_sort_by: Optional[str] = None,
+        family_sort_order: str = "asc",
+        expanded_families: Optional[list[int]] = None,
+        apply_browsing: bool = True,
     ) -> tuple[list[Patent], int]:
+        from app.services.publication_version_service import DOCUMENT_FIELDS
+        document_filters = {}
+        database = db.get(PatentDatabase, database_id) if database_id is not None else None
+        browsing = (database.browsing_config or {}) if database else {}
+        use_browsing = apply_browsing and (bool(browsing) or db.query(Patent.id).filter(
+            Patent.publication_versions.cast(String).notin_(["{}", "null"])).first() is not None)
+        if use_browsing and filters:
+            document_filters = {key: value for key, value in filters.items() if key in DOCUMENT_FIELDS}
+            filters = {key: value for key, value in filters.items() if key not in DOCUMENT_FIELDS}
         query = db.query(Patent).options(
             joinedload(Patent.tags),
             joinedload(Patent.projects),
@@ -301,12 +379,14 @@ class PatentService:
                 Patent.ai_fields.cast(String).ilike(json_search_term),
                 Patent.projects.any(Project.name.ilike(search_term)),
                 Patent.tags.any(Tag.name.ilike(search_term)),
+                Patent.publication_versions.cast(String).ilike(search_term),
+                Patent.publication_versions.cast(String).ilike(json_search_term),
             ])
             query = query.filter(or_(*search_expressions))
 
         # Placeholder identities are relation-resolution evidence, not user
         # facing rows.  They remain queryable from family/citation detail APIs.
-        query = query.filter(Patent.title != "待补全")
+        query = query.filter(Patent.title != "待补全", Patent.deleted_at.is_(None))
 
         # 库筛选：，限定查询范围到某个库
         if database_id is not None:
@@ -347,6 +427,16 @@ class PatentService:
         if country:
             query = query.filter(Patent.country == country)
 
+        if group_by_family and family_country:
+            normalized_country = family_country.strip().upper()
+            family_query = db.query(Patent.family_id).filter(
+                Patent.family_id.isnot(None), Patent.country == normalized_country,
+                Patent.deleted_at.is_(None), Patent.title != "待补全",
+            )
+            if database_id is not None:
+                family_query = family_query.filter(in_database(database_id))
+            query = query.filter(or_(Patent.family_id.in_(family_query), and_(Patent.family_id.is_(None), Patent.country == normalized_country)))
+
         if filing_date_from:
             query = query.filter(Patent.filing_date >= filing_date_from)
 
@@ -381,14 +471,34 @@ class PatentService:
                 else:
                     custom_expression = func.json_extract(Patent.custom_fields, f'$.{key}')
                     ai_expression = func.json_extract(Patent.ai_fields, f'$.{key}')
-                    custom_predicate = _apply_filter_expression(custom_expression, operator, value)
-                    ai_predicate = _apply_filter_expression(ai_expression, operator, value)
-                    if custom_predicate is not None and ai_predicate is not None:
-                        query = query.filter(
-                            and_(custom_predicate, ai_predicate)
-                            if operator == "is_empty"
-                            else or_(custom_predicate, ai_predicate)
-                        )
+                    if operator == "in":
+                        # 值清单：具体值在双投影间取 OR（值出现在任一侧即算命中），
+                        # 但“空值”必须在两侧都为空时才成立。若整体做 OR，会在字段
+                        # 只存在于 custom_fields、ai_fields 无此键时，把 ai 侧的 NULL
+                        # 误判为空值，导致勾选“(空)”命中全表。
+                        non_empty, include_empty = _split_in_values(value)
+                        value_predicates = []
+                        if non_empty:
+                            custom_predicate = _apply_filter_expression(custom_expression, "in", non_empty)
+                            ai_predicate = _apply_filter_expression(ai_expression, "in", non_empty)
+                            if custom_predicate is not None and ai_predicate is not None:
+                                value_predicates.append(or_(custom_predicate, ai_predicate))
+                        if include_empty:
+                            value_predicates.append(and_(
+                                _apply_filter_expression(custom_expression, "is_empty", None),
+                                _apply_filter_expression(ai_expression, "is_empty", None),
+                            ))
+                        if value_predicates:
+                            query = query.filter(or_(*value_predicates))
+                    else:
+                        custom_predicate = _apply_filter_expression(custom_expression, operator, value)
+                        ai_predicate = _apply_filter_expression(ai_expression, operator, value)
+                        if custom_predicate is not None and ai_predicate is not None:
+                            query = query.filter(
+                                and_(custom_predicate, ai_predicate)
+                                if operator == "is_empty"
+                                else or_(custom_predicate, ai_predicate)
+                            )
 
         # 兼容旧 custom_filters
         if custom_filters:
@@ -417,6 +527,9 @@ class PatentService:
         # 视图配置了分组字段时，先按分组字段排序。这样普通列表接口（连续滚动）
         # 与分组接口（分页/详情/全图）返回的行顺序完全一致；否则连续滚动按
         # sort_by 排、而分组接口按分组字段排，前几行会对不上。
+        # Every request owns its complete ordering. SQLAlchemy otherwise keeps
+        # earlier ORDER BY clauses when a view/grouping path appends another.
+        query = query.order_by(None)
         if group_order_fields and not group_by_family:
             for field_key, direction in group_order_fields:
                 expression = _group_order_expression(field_key)
@@ -430,12 +543,24 @@ class PatentService:
 
         # 同族聚拢模式 —— 把同族专利排在一起（family_id 非空的在前，按 family_id 分组，组内按申请日倒序）
         if group_by_family:
-            query = query.order_by(
-                Patent.family_id.is_(None),
-                Patent.family_id.asc(),
-                desc(Patent.filing_date),
-                Patent.id.asc(),
-            )
+            metric_query = db.query(Patent.family_id.label("family_id"), func.count(Patent.id).label("count"), func.min(Patent.priority_date).label("priority_date"), func.min(Patent.applicant).label("applicant"), func.min(Patent.publication_date).label("publication_date")).filter(Patent.family_id.isnot(None), Patent.deleted_at.is_(None), Patent.title != "待补全")
+            if database_id is not None: metric_query = metric_query.filter(in_database(database_id))
+            metrics = metric_query.group_by(Patent.family_id).subquery()
+            query = query.outerjoin(metrics, metrics.c.family_id == Patent.family_id)
+            family_sort = {
+                "count": metrics.c.count, "priority_date": metrics.c.priority_date,
+                "applicant": metrics.c.applicant, "publication_date": metrics.c.publication_date,
+            }.get(family_sort_by)
+            family_sort = family_sort.desc().nullslast() if family_sort is not None and family_sort_order == "desc" else family_sort.asc().nullslast() if family_sort is not None else None
+            order_columns = [Patent.family_id.is_(None)]
+            if family_sort is not None:
+                order_columns.append(family_sort)
+            order_columns.append(Patent.family_id.asc())
+            if sort_by:
+                column = _group_order_expression(sort_by)
+                if column is not None: order_columns.append(column.desc().nullslast() if sort_order == "desc" else column.asc().nullslast())
+            order_columns.extend([Patent.source_batch_id.asc().nullslast(), Patent.source_row.asc().nullslast(), Patent.id.asc()])
+            query = query.order_by(*order_columns)
         elif sort_by:
             if sort_by in SYSTEM_FIELDS:
                 column = getattr(Patent, sort_by, None)
@@ -451,9 +576,18 @@ class PatentService:
                 else:
                     query = query.order_by(func.json_extract(Patent.custom_fields, json_path), Patent.id.asc())
         else:
-            query = query.order_by(desc(Patent.created_at), Patent.id.asc())
+            # Import chronology is the canonical unsorted table order. The
+            # Excel row is retained on Patent.source_row, so records from the
+            # same batch remain exactly in their source order.
+            query = query.outerjoin(ImportBatch, ImportBatch.id == Patent.source_batch_id).order_by(
+                ImportBatch.created_at.asc().nullslast(),
+                ImportBatch.id.asc().nullslast(),
+                Patent.source_row.asc().nullslast(),
+                Patent.id.asc(),
+            )
 
-        query = query.offset((page - 1) * page_size).limit(page_size)
+        if not use_browsing:
+            query = query.offset((page - 1) * page_size).limit(page_size)
         patents = query.all()
 
         # 每条记录都来自全局 Wiki 主表；把跨库归属作为只读投影返回，
@@ -521,6 +655,17 @@ class PatentService:
                 # family_key 是稳定的来源族标识，family_id 仍只作为内部外键。
                 p.family_key = p.family.family_id if p.family is not None else None
 
+        if use_browsing:
+            from app.services.publication_version_service import present_patents, matches_document_filters
+            patents = present_patents(patents, browsing, group_by_family=group_by_family,
+                                      expanded_families=expanded_families or [])
+            if document_filters:
+                patents = [patent for patent in patents if matches_document_filters(patent, document_filters)]
+            if sort_by in DOCUMENT_FIELDS and not group_by_family:
+                patents.sort(key=lambda patent: (getattr(patent, sort_by, None) is None,
+                    str(getattr(getattr(patent, sort_by, None), "value", getattr(patent, sort_by, None)) or "")), reverse=sort_order == "desc")
+            total = len(patents)
+            patents = patents[(page - 1) * page_size:page * page_size]
         return patents, total
 
     @staticmethod
@@ -571,6 +716,8 @@ class PatentService:
                 db.add(PatentDatabaseMembership(patent_id=patent.id, database_id=database_id))
         from app.services.patent_identity_service import ensure_patent_identifiers
         ensure_patent_identifiers(db, patent, source_system="manual")
+        from app.services.publication_version_service import save_document
+        save_document(patent, data, source="manual", db=db)
         from app.services.semantic_index_service import SemanticIndexService
         SemanticIndexService.enqueue_patent(db, patent.id, "record_created")
         db.commit()
@@ -590,8 +737,15 @@ class PatentService:
         changed_by: Optional[str] = None,
         source_view_id: Optional[int] = None,
         source_view_name: Optional[str] = None,
+        import_batch_id: Optional[int] = None,
+        source_table_title: Optional[str] = None,
+        source_import_note: Optional[str] = None,
         commit: bool = True,
         run_post_update_hooks: bool = True,
+        governance_resolutions: Optional[dict[str, str]] = None,
+        governance_incoming_values: Optional[dict[str, Any]] = None,
+        governance_database_id: Optional[int] = None,
+        governance_skip_fields: Optional[set[str]] = None,
     ) -> Patent:
         """更新专利字段并写入历史记录。
 
@@ -607,6 +761,20 @@ class PatentService:
         else:
             update_data = patent_in.model_dump(exclude_unset=True)
 
+        from app.services.publication_version_service import seed_versions
+        patent.publication_versions = seed_versions(patent)
+        document_number = update_data.pop("document_number", None)
+        if document_number:
+            from app.services.publication_version_service import DOCUMENT_FIELDS, save_document
+            from app.services.patent_identity_service import normalize_publication_number
+            document_number = normalize_publication_number(document_number)
+            if document_number not in patent.publication_versions:
+                raise BadRequestException("文献版本不存在")
+            save_document(patent, update_data, number=document_number, source=source, db=db,
+                          batch_id=import_batch_id)
+            if document_number != normalize_publication_number(patent.publication_number):
+                update_data = {key: value for key, value in update_data.items() if key not in DOCUMENT_FIELDS}
+
         if update_data.get("publication_number"):
             from app.services.patent_identity_service import normalize_publication_number
             normalized_publication = normalize_publication_number(update_data["publication_number"])
@@ -617,6 +785,11 @@ class PatentService:
         tag_ids = update_data.pop("tag_ids", None)
         project_ids = update_data.pop("project_ids", None)
         custom_fields_data = update_data.pop("custom_fields", None)
+        from app.services.field_policy_service import validate_field_value
+        policies = {field["key"]: field for field in get_all_fields_meta(db)}
+        for key, value in {**update_data, **(custom_fields_data or {})}.items():
+            if key in policies:
+                validate_field_value(policies[key], value)
 
         forbidden_projection_fields = RISK_PROJECTION_FIELDS.intersection(update_data)
         if forbidden_projection_fields:
@@ -667,6 +840,9 @@ class PatentService:
                 changed_by=changed_by,
                 source_view_id=source_view_id,
                 source_view_name=source_view_name,
+                import_batch_id=import_batch_id,
+                source_table_title=source_table_title,
+                source_import_note=source_import_note,
             )
 
         # 系统字段修改
@@ -709,10 +885,66 @@ class PatentService:
 
         from app.services.patent_identity_service import ensure_patent_identifiers
         ensure_patent_identifiers(db, patent, source_system=source)
+        from app.services.publication_version_service import save_document
+        save_document(patent, update_data, number=update_data.get("publication_number") or patent.publication_number,
+                      source=source, db=db, batch_id=import_batch_id)
         db.add(patent)
         # 批量插入历史记录
         for h in history_entries:
             db.add(h)
+        imported_sources = {
+            "import": "file_import",
+            "collaboration_sync": "collaboration_sync",
+            "department_publication": "department_publication",
+            "external_sync_update": "external_sync",
+            "external_sync": "external_sync",
+            "external_sync_review": "external_sync",
+            "governance": "governance_import",
+        }
+        source_kind = imported_sources.get(source)
+        if source_kind:
+            source_labels = {
+                "import": "文件导入",
+                "collaboration_sync": "协同同步",
+                "department_publication": "部门发布",
+                "external_sync_update": "外部同步",
+                "external_sync": "外部同步",
+                "external_sync_review": "外部同步",
+                "governance": "治理映射",
+            }
+            from app.services.import_governance_service import record_import_field_change
+            for history in history_entries:
+                skip_fields = governance_skip_fields or set()
+                if history.field_key in skip_fields or (
+                    history.field_key.startswith("custom_fields.") and "custom_fields" in skip_fields
+                ):
+                    continue
+                incoming_values = governance_incoming_values or {}
+                incoming_value = incoming_values.get(history.field_key)
+                if incoming_value is None and history.field_key.startswith("custom_fields."):
+                    incoming_custom = incoming_values.get("custom_fields")
+                    if isinstance(incoming_custom, dict):
+                        incoming_value = incoming_custom.get(history.field_key.removeprefix("custom_fields."))
+                resolution = (governance_resolutions or {}).get(history.field_key)
+                if resolution is None and history.field_key.startswith("custom_fields."):
+                    resolution = (governance_resolutions or {}).get("custom_fields")
+                record_import_field_change(
+                    db,
+                    patent=patent,
+                    field_key=history.field_key,
+                    old_value=history.old_value,
+                    incoming_value=history.new_value if incoming_value is None else incoming_value,
+                    final_value=history.new_value,
+                    database_id=governance_database_id,
+                    source_kind=source_kind,
+                    source_label=source_table_title or source_import_note or source_labels.get(source, source),
+                    source_reference=f"batch:{import_batch_id}" if import_batch_id else None,
+                    import_batch_id=import_batch_id,
+                    source_field_name=history.source_field_name,
+                    resolution=resolution or "use_incoming",
+                    decided_by=changed_by,
+                    reason=source_import_note,
+                )
         if changed_fields:
             from app.services.semantic_index_service import SemanticIndexService
             SemanticIndexService.enqueue_patent(db, patent.id, "field_changed")

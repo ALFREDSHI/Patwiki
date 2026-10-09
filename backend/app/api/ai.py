@@ -11,6 +11,7 @@ from app.models.enums import CustomFieldType
 from app.config import settings
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.core.time import utc_now_naive
+from app.services.field_registry import SYSTEM_FIELD_KEYS
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
@@ -195,13 +196,16 @@ def delete_task(task_id: int, db: Session = Depends(get_db)):
 @router.get("/fields")
 def list_ai_fields(db: Session = Depends(get_db)):
     fields = db.query(CustomField).filter(
-        CustomField.field_type == "ai_field",
         CustomField.is_active == True,
     ).all()
+    fields = [f for f in fields if f.field_type == CustomFieldType.AI_FIELD or (f.ai_config or {}).get("ai_enabled") or (f.ai_config or {}).get("prompt_template")]
     return [
         {
+            "id": f.id,
             "key": f.key,
             "name": f.name,
+            "field_type": f.field_type,
+            "is_active": f.is_active,
             "description": f.description,
             "ai_config": f.ai_config,
         }
@@ -262,13 +266,14 @@ async def quick_analyze(
             if ext.target_field_key:
                 # 快速抽取只允许写入已注册的自定义字段；系统字段的正式值
                 # 需要人工确认，避免 AI 绕过字段类型和来源治理。
+                standard_ai_target = ext.target_field_key in {"technical_problem", "technical_solution", "technical_effect"}
                 field = db.query(CustomField).filter(
                     CustomField.key == ext.target_field_key,
                     CustomField.is_active == True,
                 ).first()
-                if not field:
+                if not field and not standard_ai_target:
                     raise ValueError(f"目标字段不存在或已停用：{ext.target_field_key}")
-                if field.field_type in (
+                if field and field.field_type in (
                     CustomFieldType.FORMULA,
                     CustomFieldType.ATTACHMENT,
                     CustomFieldType.LINK,
@@ -298,9 +303,18 @@ async def quick_analyze(
                 )
                 db.add(new_field)
                 db.flush()
+                field = new_field
             else:
                 raise ValueError("每个抽取目标必须选择已有字段或填写新字段名称")
 
+            if field:
+                field.ai_config = {
+                    **(field.ai_config or {}),
+                    "ai_enabled": True,
+                    "input_fields": req.input_fields,
+                    "prompt_template": req.prompt,
+                    "quick_extraction_name": ext.name.strip(),
+                }
             extraction_targets.append({
                 "name": ext.name.strip(),
                 "target_field_key": field_key,

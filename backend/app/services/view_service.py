@@ -3,8 +3,8 @@
 核心架构：单源大表 + 视图小表（Master + View）
 - 视图是 PatentDatabase（大表）上的"保存的查询"：filter + column_config + sort
 - 共享字段编辑实时写入大表，并在 PatentHistory 中记录来源视图
-- 视图本地字段独立存储，不污染大表
-- 视图本地字段可一键 promote 为全局 CustomField（同时在历史中注明来源视图）
+- 视图扩展字段是全局人工字段的显示别名，编辑写入唯一 Wiki
+- 历史本地字段在升级时提升，保留来源视图和历史原值
 """
 import hashlib
 import json
@@ -414,6 +414,10 @@ class ViewService:
         sort_order: Optional[str] = None,
         group_by_family: bool = False,
         order_by_view_grouping: bool = False,
+        family_country: Optional[str] = None,
+        family_sort_by: Optional[str] = None,
+        family_sort_order: str = "asc",
+        expanded_families: Optional[list[int]] = None,
     ) -> tuple[list[Patent], int]:
         """获取视图中的专利列表。
 
@@ -429,6 +433,13 @@ class ViewService:
 
         sort_by = sort_by or (view.sort_config or {}).get("sort_by")
         sort_order = sort_order or (view.sort_config or {}).get("sort_order", "asc")
+        aliases = {field.key: field.promoted_field_key for field in view.local_fields if field.is_promoted and field.promoted_field_key}
+
+        def canonical_key(key):
+            return aliases.get(str(key).removeprefix("view_local."), key)
+
+        merged_filters = {canonical_key(key): value for key, value in merged_filters.items()}
+        sort_by = canonical_key(sort_by) if sort_by else None
 
         group_order_fields = None
         if order_by_view_grouping and not group_by_family:
@@ -436,7 +447,7 @@ class ViewService:
             fields = config.get("fields") if isinstance(config, dict) else config
             if isinstance(fields, list):
                 group_order_fields = [
-                    (field["field"], field.get("direction", "asc"))
+                    (canonical_key(field["field"]), field.get("direction", "asc"))
                     for field in fields
                     if isinstance(field, dict) and field.get("field")
                 ] or None
@@ -451,6 +462,8 @@ class ViewService:
             sort_by=sort_by,
             sort_order=sort_order,
             group_by_family=group_by_family,
+            expanded_families=expanded_families,
+            family_country=family_country, family_sort_by=family_sort_by, family_sort_order=family_sort_order,
             group_order_fields=group_order_fields,
         )
         return patents, total
@@ -872,6 +885,9 @@ class ViewService:
         sort_by: Optional[str] = None,
         sort_order: Optional[str] = None,
         group_by_family: bool = False,
+        family_country: Optional[str] = None,
+        family_sort_by: Optional[str] = None,
+        family_sort_order: str = "asc",
     ) -> dict:
         """Return the current view page as nested groups."""
         group_fields = ViewService.validate_group_by_config(view.group_by_config).get("fields", [])
@@ -881,6 +897,7 @@ class ViewService:
             extra_filters=extra_filters, search=search,
             sort_by=sort_by, sort_order=sort_order,
             group_by_family=group_by_family,
+            family_country=family_country, family_sort_by=family_sort_by, family_sort_order=family_sort_order,
             order_by_view_grouping=True,
         )
         local_values = {}
@@ -896,7 +913,7 @@ class ViewService:
         for patent in patents:
             item = _patent_to_dict(patent)
             item["view_local_fields"] = {
-                field.key: local_values.get(patent.id, {}).get(field.key)
+                field.key: ViewService.canonical_local_value(patent, field, local_values.get(patent.id, {}).get(field.key))
                 for field in view.local_fields
             }
             items.append(item)
@@ -974,7 +991,7 @@ class ViewService:
 
         # 拼装：view_local.{key}
         patent_dict["view_local_fields"] = {
-            f.key: local_values_map.get(f.key) for f in view.local_fields
+            f.key: ViewService.canonical_local_value(patent, f, local_values_map.get(f.key)) for f in view.local_fields
         }
         return patent_dict
 
@@ -1008,12 +1025,20 @@ class ViewService:
             patent_dict = _patent_to_dict(patent)
             lv_map = local_values_by_patent.get(patent.id, {})
             patent_dict["view_local_fields"] = {
-                f.key: lv_map.get(f.key) for f in view.local_fields
+                f.key: ViewService.canonical_local_value(patent, f, lv_map.get(f.key)) for f in view.local_fields
             }
             items.append(patent_dict)
         return items
 
     # ========== 视图本地字段 CRUD ==========
+
+    @staticmethod
+    def canonical_local_value(patent, field, fallback=None):
+        if not field.is_promoted or not field.promoted_field_key:
+            return fallback
+        from app.services.field_registry import SYSTEM_FIELD_KEYS
+        key = field.promoted_field_key
+        return getattr(patent, key, None) if key in SYSTEM_FIELD_KEYS else (patent.custom_fields or {}).get(key)
 
     @staticmethod
     def create_local_field(
@@ -1056,10 +1081,19 @@ class ViewService:
         db.add(field)
         db.commit()
         db.refresh(field)
+        ViewService.promote_local_field(db, view, field, global_group="人工扩展")
         return field
 
     @staticmethod
     def update_local_field(db: Session, field: ViewLocalField, updates: dict) -> ViewLocalField:
+        if field.is_promoted and field.promoted_field_key:
+            canonical = db.query(CustomField).filter_by(key=field.promoted_field_key).first()
+            if canonical:
+                from app.models.enums import CustomFieldType
+                for key in {"name", "description", "options", "default_value", "is_required"}.intersection(updates):
+                    setattr(canonical, key, updates[key])
+                if updates.get("field_type"):
+                    canonical.field_type = CustomFieldType(updates["field_type"])
         for k, v in updates.items():
             if v is not None and hasattr(field, k):
                 setattr(field, k, v)
@@ -1070,9 +1104,7 @@ class ViewService:
 
     @staticmethod
     def delete_local_field(db: Session, field: ViewLocalField) -> bool:
-        # 已提升的字段不允许直接删除（需先取消提升）
-        if field.is_promoted:
-            return False
+        # Removing a view column leaves the canonical Wiki values and history.
         # 删除字段值
         db.query(PatentViewFieldValue).filter(
             PatentViewFieldValue.view_id == field.view_id,
@@ -1121,6 +1153,17 @@ class ViewService:
         if not field:
             raise ValueError(f"视图 {view.id} 无本地字段 {field_key}")
 
+        if not field.is_promoted:
+            ViewService.promote_local_field(db, view, field, global_group="人工扩展")
+        patent = db.get(Patent, patent_id)
+        if not patent:
+            raise ValueError(f"专利 {patent_id} 不存在")
+        from app.services.field_registry import SYSTEM_FIELD_KEYS
+        global_key = field.promoted_field_key
+        updates = {global_key: value} if global_key in SYSTEM_FIELD_KEYS else {"custom_fields": {global_key: value}}
+        PatentService.update_patent(db, patent, updates, source="manual", changed_by=changed_by,
+                                   source_view_id=view.id, source_view_name=view.name, commit=False)
+
         existing = db.query(PatentViewFieldValue).filter(
             PatentViewFieldValue.patent_id == patent_id,
             PatentViewFieldValue.view_id == view.id,
@@ -1153,7 +1196,9 @@ class ViewService:
             PatentViewFieldValue.patent_id == patent_id,
             PatentViewFieldValue.view_id == view.id,
         ).all()
-        return {r.field_key: r.value for r in rows}
+        patent = db.get(Patent, patent_id)
+        stored = {r.field_key: r.value for r in rows}
+        return {field.key: ViewService.canonical_local_value(patent, field, stored.get(field.key)) for field in view.local_fields}
 
     # ========== 共享字段编辑（写入大表 + 记录来源视图） ==========
 
@@ -1211,6 +1256,11 @@ class ViewService:
         - 标记 ViewLocalField.is_promoted=True, promoted_field_key=新 key
         """
         from app.models.enums import CustomFieldType
+
+        if field.is_promoted and field.promoted_field_key:
+            existing = db.query(CustomField).filter_by(key=field.promoted_field_key).first()
+            if existing:
+                return existing
 
         # 1. 生成全局唯一 key
         base = field.key.replace("vlf_", "cf_")
@@ -1460,6 +1510,11 @@ def _patent_to_dict(patent: Patent) -> dict:
     """
     return {
         "id": patent.id,
+        "publication_versions": patent.publication_versions or {},
+        "document_number": getattr(patent, "document_number", None),
+        "document_kind": getattr(patent, "document_kind", None),
+        "row_key": getattr(patent, "row_key", None),
+        "version_data_available": getattr(patent, "version_data_available", True),
         "application_number": patent.application_number,
         "publication_number": patent.publication_number,
         "grant_number": patent.grant_number,

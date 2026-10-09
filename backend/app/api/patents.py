@@ -28,6 +28,7 @@ from app.models import (
     PatentFamily,
     PatentHistory,
     PatentIdentifier,
+    PatentDatabaseMembership,
 )
 from app.core.exceptions import NotFoundException
 from app.core.exceptions import BadRequestException
@@ -64,6 +65,10 @@ def list_patents(
     custom_filters: Optional[str] = Query(None, description="JSON string of custom field filters"),
     filters: Optional[str] = Query(None, description="JSON string of unified field filters, supports {field: {contains: 'xxx'}, field2: {eq: 'yyy'}}"),
     group_by_family: bool = Query(False, description="同族聚拢模式：同族专利排在一起，附加 family_size"),
+    expanded_families: Optional[str] = None,
+    family_country: Optional[str] = Query(None, description="同族筛选：族内至少包含该国家/地区"),
+    family_sort_by: Optional[str] = Query(None, description="同族排序：count/priority_date/applicant/publication_date"),
+    family_sort_order: Optional[str] = Query("asc", description="同族排序方向"),
     db: Session = Depends(get_db),
 ):
     tag_ids = [tag_id] if tag_id else None
@@ -101,6 +106,10 @@ def list_patents(
         custom_filters=cf,
         filters=uf,
         group_by_family=group_by_family,
+        expanded_families=[int(value) for value in (expanded_families or "").split(",") if value.isdigit()],
+        family_country=family_country,
+        family_sort_by=family_sort_by,
+        family_sort_order=family_sort_order,
     )
     return {
         "total": total,
@@ -259,11 +268,18 @@ def replace_patent_projects(
 
 
 @router.get("/{patent_id}", response_model=Patent)
-def get_patent(patent_id: int, db: Session = Depends(get_db)):
+def get_patent(patent_id: int, publication: Optional[str] = None, db: Session = Depends(get_db)):
     patent = PatentService.get_patent(db, patent_id)
     if not patent:
         raise NotFoundException("Patent not found")
-    return patent
+    from app.services.publication_version_service import seed_versions, project_document
+    versions = seed_versions(patent)
+    if publication:
+        number = normalize_publication_number(publication)
+        if number not in versions:
+            raise NotFoundException("文献版本不存在")
+        return project_document(patent, number, versions)
+    return project_document(patent, next(iter(versions)), versions) if versions else patent
 
 
 @router.get("/{patent_id}/collaboration-states")
@@ -276,7 +292,7 @@ def get_collaboration_states(patent_id: int, authorization: str | None = Header(
 
 
 @router.get("/{patent_id}/family")
-def get_patent_family(patent_id: int, db: Session = Depends(get_db)):
+def get_patent_family(patent_id: int, database_id: int | None = None, db: Session = Depends(get_db)):
     """返回当前专利所在库中的同族成员。
 
     同族成员是独立 Patent 记录，详情页需要用其 id 进行真实导航；
@@ -285,12 +301,14 @@ def get_patent_family(patent_id: int, db: Session = Depends(get_db)):
     root = db.query(PatentModel).filter(PatentModel.id == patent_id).first()
     if not root:
         raise NotFoundException("Patent not found")
+    scope_id = database_id if database_id is not None else root.database_id
+    visible_ids = {row[0] for row in db.query(PatentModel.id).filter(in_database(scope_id), PatentModel.deleted_at.is_(None)).all()} if scope_id is not None else {root.id}
 
     members = [root]
     if root.family_id is not None:
         members = db.query(PatentModel).filter(
             PatentModel.family_id == root.family_id,
-            in_database(root.database_id),
+            PatentModel.id.in_(visible_ids), PatentModel.deleted_at.is_(None),
         ).order_by(
             (PatentModel.id == root.id).desc(),
             PatentModel.filing_date.desc(),
@@ -313,15 +331,15 @@ def get_patent_family(patent_id: int, db: Session = Depends(get_db)):
             "grant_date": member.grant_date.isoformat() if member.grant_date else None,
             "is_current": member.id == root.id,
             "database_id": member.database_id,
-            "in_current_database": member.database_id == root.database_id,
-            "status": status or ("in_database" if member.database_id == root.database_id else "other_database"),
+            "in_current_database": member.id in visible_ids,
+            "status": status or ("in_database" if member.id in visible_ids else "other_database"),
         }
 
     external_members: list[dict[str, Any]] = []
     if root.family_id is not None:
         external = db.query(PatentModel).filter(
             PatentModel.family_id == root.family_id,
-            PatentModel.database_id != root.database_id,
+            ~PatentModel.id.in_(visible_ids), PatentModel.deleted_at.is_(None),
         ).order_by(PatentModel.id.asc()).all()
         external_members = [serialize(member, "other_database") for member in external]
 
@@ -347,10 +365,10 @@ def get_patent_family(patent_id: int, db: Session = Depends(get_db)):
                 "in_current_database": False,
                 "status": "missing_record",
             })
-        elif existing.database_id == root.database_id and existing.id not in current_member_ids:
+        elif existing.id in visible_ids and existing.id not in current_member_ids:
             observed_current_members.append(serialize(existing))
             current_member_ids.add(existing.id)
-        elif existing.database_id != root.database_id and existing.id not in external_member_ids:
+        elif existing.id not in visible_ids and existing.id not in external_member_ids:
             external_members.append(serialize(existing, "other_database"))
             external_member_ids.add(existing.id)
 
@@ -625,7 +643,7 @@ def _is_ai_field(field: CustomField | None) -> bool:
     if not field:
         return False
     actual_type = field.field_type.value if hasattr(field.field_type, "value") else str(field.field_type)
-    return actual_type == CustomFieldType.AI_FIELD.value
+    return actual_type == CustomFieldType.AI_FIELD.value or bool((field.ai_config or {}).get("ai_enabled") or (field.ai_config or {}).get("prompt_template"))
 
 
 def _ai_value_response(patent: Patent, db: Session) -> list[dict[str, Any]]:

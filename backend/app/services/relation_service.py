@@ -22,6 +22,34 @@ from app.services.patent_identity_service import (
 from app.services.patent_database_scope import in_database
 
 
+def apply_external_relation(db: Session, patent: Patent, field_key: str, value: str,
+                            database_id: Optional[int], changed_by: str,
+                            *, source: str = "external_sync_update", record_audit: bool = True) -> None:
+    """Retain the reviewed relation projection and link existing records."""
+    from app.models import PatentHistory
+    from app.services.import_governance_service import record_import_field_change
+    processors = {
+        "family_members": process_family_members,
+        "cited_patents": process_citations,
+        "citing_patents": process_citing_patents,
+    }
+    old = (patent.custom_fields or {}).get(field_key)
+    processors[field_key](db, patent, parse_patent_numbers(value or ""),
+                          database_id=database_id, create_placeholders=False)
+    if old != value:
+        patent.custom_fields = {**(patent.custom_fields or {}), field_key: value}
+        db.add(PatentHistory(patent_id=patent.id, field_key=field_key,
+                             old_value=old, new_value=value, source=source,
+                             changed_by=changed_by))
+        if record_audit:
+            record_import_field_change(
+                db, patent=patent, field_key=field_key, old_value=old,
+                incoming_value=value, final_value=value, database_id=database_id,
+                source_kind="external_sync", source_label="MCP relation update",
+                decided_by=changed_by,
+            )
+
+
 # 同族/引用列的常见分隔符：分号、逗号、顿号、竖线、换行、Tab、连续空格（≥2）
 # 竖线 | 是 incopat 等导出工具常见分隔符；连续空格用于应对无显式分隔符但用空格对齐的情况
 SPLIT_PATTERN = re.compile(r"[;；,，、|/\\\n\r\t]+|\s{2,}")
@@ -176,33 +204,11 @@ def _find_or_create_patent_by_number(
         # 的保守行为：不选择任意一条已有专利。
         return None
 
-    # 生成查询变体：原号、去后缀号、补国家码号
-    variants = _generate_lookup_variants(number)
-
-    # UNIQUE 约束是全局的（不含 database_id），查找也必须全局查找。
-    # 先在当前库内找（优先复用同库专利），找不到再跨库找。
-    for variant in variants:
-        # 优先在当前库内匹配
-        if database_id is not None:
-            existing = db.query(Patent).filter(
-                in_database(database_id),
-                Patent.application_number == variant,
-            ).first()
-            if existing:
-                return existing
-            existing = db.query(Patent).filter(
-                in_database(database_id),
-                Patent.publication_number == variant,
-            ).first()
-            if existing:
-                return existing
-        # 跨库匹配（避免 UNIQUE 约束冲突）
-        existing = db.query(Patent).filter(Patent.application_number == variant).first()
-        if existing:
-            return existing
-        existing = db.query(Patent).filter(Patent.publication_number == variant).first()
-        if existing:
-            return existing
+    matches = db.query(Patent).filter(
+        (Patent.application_number == number) | (Patent.publication_number == number) | (Patent.grant_number == number),
+    ).all()
+    if matches:
+        return matches[0] if len(matches) == 1 and matches[0].deleted_at is None else None
 
     if not create_placeholder:
         return None
@@ -249,14 +255,14 @@ def find_existing_patent_by_number(
     if len(identity_matches) > 1:
         return None
 
-    for variant in _generate_lookup_variants(normalized):
-        existing = db.query(Patent).filter(
-            (Patent.application_number == variant)
-            | (Patent.publication_number == variant)
-            | (Patent.grant_number == variant)
-        ).first()
-        if existing:
-            return existing
+    existing = db.query(Patent).filter(
+        Patent.deleted_at.is_(None),
+        (Patent.application_number == normalized)
+        | (Patent.publication_number == normalized)
+        | (Patent.grant_number == normalized),
+    ).all()
+    if len(existing) == 1:
+        return existing[0]
     return None
 
 
@@ -376,7 +382,7 @@ def process_family_members(
     return {"family_id": family.id, "members_created": members_created, "members_linked": members_linked}
 
 
-def rebuild_database_families(db: Session, database_id: int) -> dict:
+def rebuild_database_families(db: Session, database_id: int, *, commit: bool = True) -> dict:
     """从历史导入保留的同族列重建当前库的同族聚拢关系。
 
     早期导入为了避免制造大量待补全记录，只保存了 ``family_members``
@@ -386,7 +392,9 @@ def rebuild_database_families(db: Session, database_id: int) -> dict:
     # same visibility predicate used by list/search so family magnets do not
     # disappear when an imported record is owned by the master database.
     from app.services.patent_database_scope import in_database
-    patents = db.query(Patent).filter(in_database(database_id)).all()
+    # Families belong to the global Wiki. Rebuilding only a library subset
+    # would change the grouping of records visible in other libraries.
+    patents = db.query(Patent).filter(Patent.deleted_at.is_(None)).all()
     by_number: dict[str, set[int]] = {}
     patent_by_id = {patent.id: patent for patent in patents if patent.id is not None}
 
@@ -421,8 +429,10 @@ def rebuild_database_families(db: Session, database_id: int) -> dict:
             union(ids[0], member_id)
 
     existing_groups: dict[int, list[int]] = {}
+    family_keys = {family.id: family.family_id for family in db.query(PatentFamily).all()}
     for patent in patents:
-        if patent.id is not None and patent.family_id is not None:
+        if (patent.id is not None and patent.family_id is not None
+                and not re.fullmatch(r"FAM_[0-9a-f]{12}", family_keys.get(patent.family_id, ""))):
             existing_groups.setdefault(patent.family_id, []).append(patent.id)
     for member_ids in existing_groups.values():
         for member_id in member_ids[1:]:
@@ -439,7 +449,8 @@ def rebuild_database_families(db: Session, database_id: int) -> dict:
             fields.get("同族公开号"),
         ):
             for number in parse_patent_numbers(raw_value or ""):
-                for member_id in by_number.get(number, set()):
+                matches = by_number.get(number, set())
+                for member_id in matches if len(matches) == 1 else ():
                     if member_id != patent.id:
                         union(patent.id, member_id)
                         relation_matches += 1
@@ -477,6 +488,7 @@ def rebuild_database_families(db: Session, database_id: int) -> dict:
             if member.family_id is not None and member.family_id in family_by_row_id:
                 votes[member.family_id] = votes.get(member.family_id, 0) + 1
         family = None
+        votes = {row_id: count for row_id, count in votes.items() if row_id not in reused_families}
         if votes:
             chosen_row_id = max(
                 votes,
@@ -491,6 +503,7 @@ def rebuild_database_families(db: Session, database_id: int) -> dict:
                 [member.publication_number or member.application_number or "" for member in members],
             )
             family_by_row_id[family.id] = family
+        reused_families.add(family.id)
         for member in members:
             member.family_id = family.id
             grouped_patent_ids.add(member.id)
@@ -503,6 +516,7 @@ def rebuild_database_families(db: Session, database_id: int) -> dict:
 
     # Drop families left without any member (e.g. legacy hash-keyed rows from
     # earlier rebuilds) so repeated rebuilds do not accumulate garbage rows.
+    db.flush()
     referenced_family_ids = {
         row_id
         for (row_id,) in db.query(Patent.family_id).filter(Patent.family_id.isnot(None)).distinct()
@@ -513,7 +527,8 @@ def rebuild_database_families(db: Session, database_id: int) -> dict:
     for family in orphaned_families:
         db.delete(family)
 
-    db.commit()
+    if commit:
+        db.commit()
     return {
         "database_id": database_id,
         "patent_count": len(patents),

@@ -7,6 +7,7 @@ never creates a Patent during preview or confirmation.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from hashlib import sha256
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -28,10 +29,10 @@ from app.models import (
 from app.services.patent_service import PatentService
 from app.services.patent_database_scope import in_database
 from app.services.sync_reconciliation import apply_legal_events, resolve_patent
-from app.services.sync_support import LEGAL_STATUS_MAP, SAFE_EXTERNAL_FIELDS, date_value, hash_payload, now, serialize_value
+from app.services.sync_support import EXTERNAL_RELATION_FIELDS, LEGAL_STATUS_MAP, MCP_CUSTOM_FIELDS, REVIEWABLE_EXTERNAL_FIELDS, date_value, hash_payload, now, serialize_value
 
 
-EXPLICIT_UPDATE_FIELDS = frozenset(SAFE_EXTERNAL_FIELDS) | {"legal_status"}
+EXPLICIT_UPDATE_FIELDS = frozenset(REVIEWABLE_EXTERNAL_FIELDS) | {"legal_status"}
 DEFAULT_UPDATE_FIELDS = tuple(sorted(EXPLICIT_UPDATE_FIELDS))
 UPDATE_BATCH_TTL_MINUTES = 30
 
@@ -41,10 +42,14 @@ class SyncUpdateService:
     def _validate_fields(fields: list[str] | None, connector: ConnectorDefinition | None = None) -> list[str]:
         allowed: set[str] | None = None
         if connector and connector.provider_type in {"himmpat_mcp", "mcp_himmpat"}:
-            allowed = {"publication_number", "application_number", "title", "abstract", "applicant", "assignee", "inventor", "filing_date", "publication_date", "country", "ipc_all"}
+            from app.integrations.himmpat import DOSSIER_UPDATE_FIELDS
+            allowed = set(DOSSIER_UPDATE_FIELDS) | {"legal_status", "grant_date"}
             if (connector.config_json or {}).get("enrich_legal_on_fetch") or (connector.config_json or {}).get("enrich_legal_status"):
                 allowed.update({"legal_status", "grant_date"})
-        requested = list(dict.fromkeys(fields if fields is not None else (sorted(allowed) if allowed is not None else DEFAULT_UPDATE_FIELDS)))
+        defaults = sorted(allowed - set(MCP_CUSTOM_FIELDS) - EXTERNAL_RELATION_FIELDS - {"claims", "description_full", "technical_problem", "technical_solution", "technical_effect", "agent", "priority_number", "priority_date"}) if allowed is not None else DEFAULT_UPDATE_FIELDS
+        requested = list(dict.fromkeys(fields if fields is not None else defaults))
+        aliases = {"mcp_family_members": "family_members", "mcp_cited_patents": "cited_patents"}
+        requested = list(dict.fromkeys(aliases.get(field, field) for field in requested))
         invalid = sorted(set(requested) - EXPLICIT_UPDATE_FIELDS)
         if invalid:
             raise BadRequestException("外部更新不允许覆盖字段：" + ", ".join(invalid))
@@ -63,7 +68,11 @@ class SyncUpdateService:
 
     @staticmethod
     def _identifiers(patent: Patent) -> list[ProviderIdentifier]:
-        result = [
+        result = []
+        if patent.publication_number:
+            from app.services.patent_identity_service import normalize_publication_number
+            result.append(ProviderIdentifier("publication", normalize_publication_number(patent.publication_number) or patent.publication_number, patent.country))
+        result.extend([
             ProviderIdentifier(
                 identifier_type=item.identifier_type,
                 raw_value=item.raw_value,
@@ -73,20 +82,20 @@ class SyncUpdateService:
             )
             for item in patent.identifiers
             if item.raw_value
-        ]
-        if result:
-            return result
+        ])
         for identifier_type, value in (
             ("publication", patent.publication_number),
             ("application", patent.application_number),
             ("grant", patent.grant_number),
         ):
-            if value:
+            if value and not any(item.identifier_type == identifier_type and item.raw_value == str(value) for item in result):
                 result.append(ProviderIdentifier(identifier_type, str(value), patent.country))
         return result
 
     @staticmethod
     def _normalized_candidate(field_key: str, value: Any) -> Any:
+        if field_key.startswith("mcp_"):
+            return value
         if field_key == "legal_status":
             mapped = LEGAL_STATUS_MAP.get(str(value).strip().lower(), "unknown")
             return None if mapped == "unknown" and str(value).strip().lower() not in {"unknown", ""} else mapped
@@ -96,8 +105,11 @@ class SyncUpdateService:
         return serialize_value(value)
 
     @staticmethod
-    def _current_value(patent: Patent, field_key: str) -> str | None:
-        value = getattr(patent, field_key, None)
+    def _current_value(patent: Patent, field_key: str) -> Any:
+        if field_key.startswith("mcp_") or field_key in EXTERNAL_RELATION_FIELDS:
+            value = (patent.custom_fields or {}).get(field_key)
+        else:
+            value = getattr(patent, field_key, None)
         return serialize_value(value)
 
     @staticmethod
@@ -105,9 +117,13 @@ class SyncUpdateService:
         candidates: dict[str, Any] = {}
         for field_key in fields:
             raw_value = record.fields.get(field_key)
+            if field_key == "family_members" and raw_value is None:
+                # The provider keeps the auditable payload under mcp_*, while
+                # the editable PatWiki projection is the relation field.
+                raw_value = SyncUpdateService._family_numbers(record.fields.get("mcp_family_members"))
             if field_key == "legal_status" and raw_value is None and record.legal_events:
                 raw_value = max(record.legal_events, key=lambda item: item.event_date).status
-            if raw_value is None:
+            if raw_value is None or raw_value == "" or raw_value == [] or raw_value == {}:
                 continue
             candidate = SyncUpdateService._normalized_candidate(field_key, raw_value)
             if candidate is not None:
@@ -115,16 +131,71 @@ class SyncUpdateService:
         return candidates
 
     @staticmethod
+    def _family_numbers(value: Any) -> str:
+        from app.integrations.himmpat import HimmPatMcpAdapter
+        return ", ".join(HimmPatMcpAdapter._patent_numbers(value))
+
     @staticmethod
-    def _fetch_record(connector: Any, patent: Patent) -> ProviderPatentRecord:
+    def _materialize_mcp_resources(db: Session, batch: SyncUpdateBatch, patent: Patent, candidates: dict[str, Any], fields: list[str], confirmed_by: str) -> None:
+        """Download selected PDF/images into PatWiki's attachment store."""
+        resource_fields = {"mcp_pdf_original", "mcp_abstract_figure", "mcp_description_figures"}
+        selected = resource_fields.intersection(fields)
+        if not selected:
+            return
+        from app.integrations.registry import get_connector
+        from app.services.attachment_service import AttachmentService
+        from app.models import Attachment
+        runtime = get_connector(batch.connector)
+        try:
+            for field in sorted(selected):
+                raw = candidates.get(field)
+                resources = raw if isinstance(raw, list) else [raw]
+                for resource in resources:
+                    if not isinstance(resource, dict) or not resource.get("path"):
+                        continue
+                    kind = str(resource.get("resource_kind") or ("pdf" if field == "mcp_pdf_original" else "image"))
+                    # PDF originals stay in the general attachment library;
+                    # abstract/description figures belong to the dedicated
+                    # patent-figure area so they render in the patent Wiki.
+                    target_field = "attachments" if kind == "pdf" else "patent_figures"
+                    content, mime = runtime.download_resource(str(resource["path"]), "pdf" if kind == "pdf" else "image")
+                    digest = sha256(content).hexdigest()
+                    duplicate = db.query(Attachment.id).filter(
+                        Attachment.database_id == batch.database_id,
+                        Attachment.patent_id == patent.id,
+                        Attachment.field_key == target_field,
+                        Attachment.sha256 == digest,
+                        Attachment.deleted_at.is_(None),
+                    ).first()
+                    if duplicate:
+                        continue
+                    extension = ".pdf" if kind == "pdf" else (".png" if mime == "image/png" else ".jpg")
+                    filename = f"{patent.publication_number or patent.id}-{field}{resource.get('figure_index', '')}{extension}"
+                    AttachmentService.create_from_bytes(
+                        db, batch.database_id, patent.id, target_field, filename, content, mime,
+                        uploaded_by=confirmed_by, source_type="mcp",
+                        source_url=f"himmpat://{kind}/{resource['path']}", commit=False,
+                    )
+        finally:
+            close = getattr(runtime, "close", None)
+            if callable(close):
+                close()
+
+    @staticmethod
+    def _fetch_record(connector: Any, patent: Patent, fields: list[str] | None = None) -> ProviderPatentRecord:
         identifiers = SyncUpdateService._identifiers(patent)
         if not identifiers:
             raise ValueError("专利没有可用于外部检索的申请号、公开号或授权号")
         last_error: Exception | None = None
         for identifier in identifiers:
             try:
+                fetch_fields = getattr(connector, "fetch_patent_fields", None)
+                if fields is not None and callable(fetch_fields):
+                    return fetch_fields(identifier, set(fields))
                 return connector.fetch_patent(identifier)
             except Exception as exc:  # Providers differ in which identifier types they accept.
+                if getattr(exc, "error_code", None) and exc.error_code != "patent_not_found":
+                    raise
                 last_error = exc
         raise last_error or LookupError("外部数据未找到")
 
@@ -258,7 +329,7 @@ class SyncUpdateService:
                     run.counts_json["errors"] += 1
                     continue
                 try:
-                    record = cls._fetch_record(runtime_connector, patent)
+                    record = cls._fetch_record(runtime_connector, patent, selected_fields)
                 except Exception as exc:
                     item.status = "not_found"
                     item.error_code = getattr(exc, "error_code", "provider_not_found")
@@ -303,7 +374,7 @@ class SyncUpdateService:
                 run.counts_json["matched"] += 1
                 candidates = cls._record_candidates(record, selected_fields)
                 current = {field_key: cls._current_value(patent, field_key) for field_key in candidates}
-                changed = [field_key for field_key in candidates if current.get(field_key) != serialize_value(candidates[field_key])]
+                changed = [field_key for field_key in candidates if serialize_value(current.get(field_key)) != serialize_value(candidates[field_key])]
                 item.current_fields = current
                 item.candidate_fields = candidates
                 item.changed_fields = changed
@@ -319,7 +390,7 @@ class SyncUpdateService:
                         canonical_field_key=field_key,
                         raw_value=serialize_value(candidate),
                         normalized_value=serialize_value(candidate),
-                        current_value=current.get(field_key),
+                        current_value=serialize_value(current.get(field_key)),
                         candidate_value=serialize_value(candidate),
                         confidence="high",
                         decision="pending_update" if field_key in changed else "no_change",
@@ -342,6 +413,133 @@ class SyncUpdateService:
                 close = getattr(runtime_connector, "close", None)
                 if callable(close):
                     close()
+
+    @classmethod
+    def preview_from_records(
+        cls,
+        db: Session,
+        connector: ConnectorDefinition,
+        database_id: int,
+        records: dict[int, ProviderPatentRecord],
+        fields: list[str] | None = None,
+        *,
+        request_metadata: dict[str, Any] | None = None,
+    ) -> SyncUpdateBatch:
+        """Build an update preview from already-fetched provider records.
+
+        The MCP tool workbench produces a raw tool result per patent; mapping
+        it to a ``ProviderPatentRecord`` lets those values flow through the
+        same review/confirm pipeline as a normal refresh, so a tool result is
+        written back to fields instead of only being stored as a snapshot.
+        """
+        selected_fields = cls._validate_fields(fields, connector)
+        requested_ids = list(dict.fromkeys(records))
+        if not requested_ids:
+            raise BadRequestException("至少选择一条专利")
+        patents = {patent.id: patent for patent in db.query(Patent).filter(Patent.id.in_(requested_ids)).all()}
+        run = SyncRun(
+            connector_id=connector.id,
+            database_id=database_id,
+            trigger="mcp_tool_map_preview",
+            status="running",
+            started_at=now(),
+            counts_json={"pages": 1, "records": 0, "matched": 0, "ready": 0, "no_change": 0, "errors": 0, "observations": 0, "legal_events": 0},
+        )
+        db.add(run)
+        db.flush()
+        batch = SyncUpdateBatch(
+            connector_id=connector.id,
+            database_id=database_id,
+            sync_run_id=run.id,
+            status="preview",
+            requested_patent_ids=requested_ids,
+            selected_fields=selected_fields,
+            expires_at=now() + timedelta(minutes=UPDATE_BATCH_TTL_MINUTES),
+        )
+        db.add(batch)
+        db.flush()
+        try:
+            for patent_id in requested_ids:
+                patent = patents.get(patent_id)
+                item = SyncUpdateItem(batch_id=batch.id, patent_id=patent_id, selected_fields=[])
+                db.add(item)
+                db.flush()
+                run.counts_json["records"] += 1
+                if patent is None:
+                    item.status = "not_found"
+                    item.error_code = "patent_not_found"
+                    item.error_message = "本地专利不存在"
+                    run.counts_json["errors"] += 1
+                    continue
+                if not cls._patent_in_database(db, patent, database_id):
+                    item.status = "out_of_scope"
+                    item.error_code = "patent_out_of_scope"
+                    item.error_message = "专利不属于当前数据库"
+                    run.counts_json["errors"] += 1
+                    continue
+                record = records[patent_id]
+                item.external_record_id = record.external_record_id
+                payload = record.as_payload()
+                snapshot = ExternalSnapshot(
+                    connector_id=connector.id,
+                    sync_run_id=run.id,
+                    request_metadata={**(request_metadata or {}), "patent_id": patent.id},
+                    payload_json=payload,
+                    payload_hash=hash_payload(payload),
+                    source_version=record.source_version,
+                )
+                db.add(snapshot)
+                db.flush()
+                sync_record = SyncRecord(
+                    sync_run_id=run.id,
+                    external_record_id=record.external_record_id,
+                    external_snapshot_id=snapshot.id,
+                    patent_id=patent.id,
+                    identity_status="matched",
+                    outcome="update_preview",
+                    idempotency_key=hash_payload({"batch": batch.id, "patent": patent.id, "record": record.external_record_id}),
+                )
+                db.add(sync_record)
+                db.flush()
+                item.sync_record_id = sync_record.id
+                item.external_snapshot_id = snapshot.id
+                run.counts_json["matched"] += 1
+                candidates = cls._record_candidates(record, selected_fields)
+                current = {field_key: cls._current_value(patent, field_key) for field_key in candidates}
+                changed = [field_key for field_key in candidates if serialize_value(current.get(field_key)) != serialize_value(candidates[field_key])]
+                item.current_fields = current
+                item.candidate_fields = candidates
+                item.changed_fields = changed
+                item.selected_fields = changed.copy()
+                item.status = "ready" if changed or record.legal_events else "no_change"
+                run.counts_json[item.status] += 1
+                for field_key, candidate in candidates.items():
+                    observation = ExternalFactObservation(
+                        sync_run_id=run.id,
+                        external_snapshot_id=snapshot.id,
+                        sync_record_id=sync_record.id,
+                        patent_id=patent.id,
+                        canonical_field_key=field_key,
+                        raw_value=serialize_value(candidate),
+                        normalized_value=serialize_value(candidate),
+                        current_value=serialize_value(current.get(field_key)),
+                        candidate_value=serialize_value(candidate),
+                        confidence="high",
+                        decision="pending_update" if field_key in changed else "no_change",
+                    )
+                    db.add(observation)
+                    run.counts_json["observations"] += 1
+                run.counts_json["legal_events"] += len(record.legal_events)
+            run.counts_json["errors"] = int(run.counts_json["errors"])
+            run.status = "succeeded"
+            run.finished_at = now()
+            flag_modified(run, "counts_json")
+            db.commit()
+            db.refresh(batch)
+            return batch
+        except Exception:
+            db.rollback()
+            raise
 
     @classmethod
     def confirm(cls, db: Session, batch: SyncUpdateBatch, selected_items: list[dict[str, Any]], confirmed_by: str) -> SyncUpdateBatch:
@@ -370,15 +568,36 @@ class SyncUpdateService:
                     raise BadRequestException(f"专利 {item.patent_id} 已不存在")
                 for field_key in fields:
                     before = cls._current_value(patent, field_key)
-                    if before != (item.current_fields or {}).get(field_key):
+                    if serialize_value(before) != serialize_value((item.current_fields or {}).get(field_key)):
                         raise BadRequestException(f"专利 {item.patent_id} 的字段 {field_key} 在预览后已发生变化，请重新预览")
                 update_values = {}
+                custom_values = {}
                 for field_key in fields:
                     candidate = (item.candidate_fields or {}).get(field_key)
+                    if field_key in EXTERNAL_RELATION_FIELDS:
+                        continue
                     if field_key != "legal_status":
-                        update_values[field_key] = date_value(candidate) if field_key.endswith("_date") else candidate
+                        if field_key.startswith("mcp_"):
+                            custom_values[field_key] = candidate
+                        else:
+                            update_values[field_key] = date_value(candidate) if field_key.endswith("_date") else candidate
+                if custom_values:
+                    update_values["custom_fields"] = custom_values
+                for field_key in EXTERNAL_RELATION_FIELDS.intersection(fields):
+                    from app.services.relation_service import apply_external_relation
+                    apply_external_relation(db, patent, field_key, (item.candidate_fields or {}).get(field_key), batch.database_id, confirmed_by)
+                if any(field.startswith("mcp_") for field in fields):
+                    cls._materialize_mcp_resources(db, batch, patent, item.candidate_fields or {}, fields, confirmed_by)
                 if update_values:
-                    PatentService.update_patent(db, patent, update_values, source="external_sync_update", changed_by=confirmed_by, commit=False)
+                    PatentService.update_patent(
+                        db,
+                        patent,
+                        update_values,
+                        source="external_sync_update",
+                        changed_by=confirmed_by,
+                        commit=False,
+                        governance_database_id=batch.database_id,
+                    )
                 # Legal events are retained as provider evidence whenever an
                 # item is confirmed.  The current Patent projection changes
                 # only when the user explicitly selects legal_status.

@@ -8,19 +8,24 @@ import type {
   AgentAnalysisResult, LinkRecord, LinkTarget, RelationBatchItem, PatentShare, PublicPatentShare, SearchSuggestion,
   PatentGraphResponse, PatentFamilyResponse, PatentCitationResponse, FormulaReturnType, FormDefinition, FormShareLink, GanttResponse, AttachmentMeta,
   Dashboard, DashboardCard, DashboardData, AutomationRule, AutomationLog, CommentRecord,
-  SyncConnector, SyncSubscription, SyncRun, ExternalObservation, LegalStatusEvent, WatchEvent, SyncUpdateBatch,
-  GovernanceAction, GovernanceDecision, GovernanceObservation, GovernanceBatch,
+  SyncConnector, SyncSubscription, SyncRun, SyncRecord, ExternalObservation, LegalStatusEvent, WatchEvent, SyncUpdateBatch,
+  GovernanceAction, GovernanceDecision, GovernanceObservation, GovernanceBatch, ImportFieldGovernanceAudit,
   ImportChangeReview, ImportReviewAction,
   ProjectSolutionVersion, RiskCase,
   ProjectHistoryEntry,
   SemanticSearchMode, SemanticSearchResponse,
   SemanticProvider, SemanticProfile, SemanticIndex, SemanticJob, SemanticStatus,
   SemanticEvaluationDataset, SemanticEvaluationCase, SemanticEvaluationRun,
-  CollaborationIdentity, CollaborationPackage,
+  CollaborationIdentity, CollaborationPackage, SyncGovernanceConflict,
+  FieldVersions, ImportDraft,
 } from '../types'
 
 export const fieldApi = {
   list: (): Promise<FieldMeta[]> => api.get('/fields'),
+  setPolicy: (key: string, policy: Pick<FieldMeta, 'value_source' | 'value_stability' | 'merge_policy' | 'validation_rules'>): Promise<FieldMeta> => api.put(`/fields/${encodeURIComponent(key)}/policy`, policy),
+  versions: (id: number, key: string): Promise<FieldVersions> => api.get(`/patents/${id}/field/${encodeURIComponent(key)}/versions`),
+  saveVersion: (id: number, key: string, value: string | null, expectedValue: string | null): Promise<FieldVersions> => api.put(`/patents/${id}/field/${encodeURIComponent(key)}/versions`, { value, expected_value: expectedValue }),
+  consolidate: (key: string, target: string, action: string, apply = false): Promise<{ records: number; changed: number; conflicts: number; applied: boolean; issues: { patent_id: number; reason: string }[] }> => api.post(`/fields/${encodeURIComponent(key)}/consolidate`, { target_field: target, conflict_action: action, apply }),
 }
 
 // 库（Database）API
@@ -37,6 +42,7 @@ export const databaseApi = {
 
   update: (id: number, data: Partial<PatentDatabase>): Promise<PatentDatabase> =>
     api.put(`/databases/${id}`, data),
+  browsingConfig: (id: number, data: NonNullable<PatentDatabase['browsing_config']>): Promise<PatentDatabase> => api.put(`/databases/${id}/browsing-config`, data),
 
   archive: (id: number): Promise<PatentDatabase> =>
     api.post(`/databases/${id}/archive`),
@@ -126,12 +132,16 @@ export const viewApi = {
     api.delete(`/views/${viewId}/patents`, { data: { patent_ids: patentIds } }),
 
   listPatents: (viewId: number, params: {
+    expanded_families?: string
     page?: number
     page_size?: number
     search?: string
     sort_by?: string
     sort_order?: 'asc' | 'desc'
     group_by_family?: boolean
+    family_country?: string
+    family_sort_by?: 'count' | 'priority_date' | 'applicant' | 'publication_date'
+    family_sort_order?: 'asc' | 'desc'
     order_by_view_grouping?: boolean
     extra_filters?: JsonObject
   } = {}): Promise<ViewPatentListResponse> => {
@@ -153,6 +163,9 @@ export const viewApi = {
     sort_by?: string
     sort_order?: 'asc' | 'desc'
     group_by_family?: boolean
+    family_country?: string
+    family_sort_by?: 'count' | 'priority_date' | 'applicant' | 'publication_date'
+    family_sort_order?: 'asc' | 'desc'
     extra_filters?: JsonObject
   } = {}): Promise<GroupedViewResponse> => {
     const { extra_filters, ...query } = params
@@ -335,6 +348,8 @@ export const syncApi = {
   updateConnector: (id: number, data: { enabled?: boolean }): Promise<SyncConnector> => api.patch(`/sync/connectors/${id}`, data),
   testConnector: (id: number): Promise<{ status: string; message: string; latency_ms?: number | null }> => api.post(`/sync/connectors/${id}/test`),
   discoverConnector: (id: number): Promise<JsonObject> => api.post(`/sync/connectors/${id}/discover`),
+  callConnectorTool: (id: number, data: { service: string; tool: string; arguments: JsonObject }): Promise<JsonObject> => api.post(`/sync/connectors/${id}/tools/call`, data),
+  mapToolResultPreview: (id: number, data: { database_id: number; patent_id: number; service: string; tool: string; arguments: JsonObject; fields?: string[] }): Promise<SyncUpdateBatch> => api.post(`/sync/connectors/${id}/tools/map-preview`, data),
   connectorCredentials: (id: number): Promise<{ items: JsonObject[] }> => api.get(`/sync/connectors/${id}/credentials`),
   addConnectorCredential: (id: number, data: { credential_ref: string; credential_type?: string; label?: string }): Promise<JsonObject> => api.post(`/sync/connectors/${id}/credentials`, data),
   queries: (databaseId?: number | null): Promise<{ items: JsonObject[] }> => api.get('/sync/queries', { params: { database_id: databaseId ?? undefined } }),
@@ -352,8 +367,13 @@ export const syncApi = {
   }): Promise<SyncSubscription> => api.post('/sync/subscriptions', data),
   subscriptions: (databaseId?: number | null): Promise<{ items: SyncSubscription[] }> => api.get('/sync/subscriptions', { params: { database_id: databaseId ?? undefined } }),
   runSubscription: (id: number, maxPages = 100): Promise<SyncRun> => api.post(`/sync/subscriptions/${id}/run`, { trigger: 'manual', max_pages: maxPages }),
+  refreshPatent: (data: { connector_id: number; identifier_type: string; identifier: string; database_id?: number | null; review_policy?: string; fields?: string[] }): Promise<SyncRun> => api.post('/sync/patents/refresh', data),
+  deleteSubscription: (id: number): Promise<{ success: boolean }> => api.delete(`/sync/subscriptions/${id}`),
+  updateSubscription: (id: number, data: JsonObject): Promise<SyncSubscription> => api.patch(`/sync/subscriptions/${id}`, data),
   runs: (subscriptionId?: number | null): Promise<{ items: SyncRun[] }> => api.get('/sync/runs', { params: { subscription_id: subscriptionId ?? undefined, limit: 50 } }),
+  runRecords: (runId: number): Promise<{ items: SyncRecord[] }> => api.get(`/sync/runs/${runId}/records`, { params: { limit: 500 } }),
   observations: (decision = 'pending_review'): Promise<{ items: ExternalObservation[] }> => api.get('/sync/observations', { params: { decision, limit: 100 } }),
+  runObservations: (runId: number): Promise<{ items: ExternalObservation[] }> => api.get('/sync/observations', { params: { run_id: runId, limit: 2000 } }),
   decideObservation: (id: number, decision: 'accepted' | 'rejected', decidedBy = 'local-user'): Promise<ExternalObservation> => api.post(`/sync/observations/${id}/decision`, { decision, decided_by: decidedBy }),
   legalEvents: (patentId: number): Promise<{ items: LegalStatusEvent[] }> => api.get(`/sync/patents/${patentId}/legal-events`),
   watchEvents: (databaseId?: number | null): Promise<{ items: WatchEvent[] }> => api.get('/sync/watch-events', { params: { database_id: databaseId ?? undefined, limit: 100 } }),
@@ -384,7 +404,7 @@ export const patentApi = {
   list: (params: JsonObject = {}): Promise<PatentListResponse> =>
     api.get('/patents', { params }),
 
-  get: (id: number): Promise<Patent> => api.get(`/patents/${id}`),
+  get: (id: number, publication?: string): Promise<Patent> => api.get(`/patents/${id}`, { params: { publication } }),
   resolvePublicationNumber: (publicationNumber: string): Promise<{
     found: boolean
     publication_number: string
@@ -575,10 +595,15 @@ export const importApi = {
     api.get('/import/batches', { params }),
 
   getBatch: (id: number): Promise<ImportBatch> => api.get(`/import/batches/${id}`),
-  getChanges: (id: number, onlyDifferences = false): Promise<{ batch_id: number; status: string; total: number; items: ImportChangeReview[] }> =>
-    api.get(`/import/batches/${id}/changes`, { params: { only_differences: onlyDifferences } }),
+  records: (id: number, offset = 0): Promise<{ items: Array<{ source_row?: number; patent_id?: number | null; title?: string; status: string; reason?: string; publication_number?: string; application_number?: string; numbers: Record<string, string> }>; total: number }> => api.get(`/import/batches/${id}/records`, { params: { offset, limit: 100 } }),
+  resumeBatch: (id: number): Promise<{ import_id: string }> => api.post(`/import/batches/${id}/resume`),
+  getChanges: (id: number, onlyDifferences = false, offset = 0, limit = 2000, onlyConflicts = false): Promise<{ batch_id: number; status: string; total: number; offset: number; limit: number; items: ImportChangeReview[] }> =>
+    api.get(`/import/batches/${id}/changes`, { params: { only_differences: onlyDifferences, only_conflicts: onlyConflicts, offset, limit } }),
+  listDrafts: (databaseId: number): Promise<{ import_id: string; filename: string; batch_id?: number; updated_at?: string }[]> => api.get('/import/sessions', { params: { database_id: databaseId } }),
+  getDraft: (id: string, sheet?: string): Promise<{ preview: ImportPreview; draft: ImportDraft; batch_id?: number; filename: string }> => api.get(`/import/sessions/${id}`, { params: { sheet_name: sheet } }),
+  saveDraft: (id: string, draft: ImportDraft): Promise<{ saved: boolean }> => api.put(`/import/sessions/${id}`, draft),
   reviewBatch: (id: number, data: {
-    items?: { observation_id: number; action: ImportReviewAction }[]
+    items?: { observation_id: number; action: ImportReviewAction; merge_value?: string }[]
     default_action?: ImportReviewAction
     reviewed_by?: string
     reason?: string
@@ -588,6 +613,8 @@ export const importApi = {
     api.post(`/import/batches/${id}/rollback`, { rolled_back_by: rolledBackBy }),
   listUnmapped: (params: JsonObject = {}): Promise<{ total: number; offset: number; limit: number; items: GovernanceObservation[] }> =>
     api.get('/import/unmapped', { params }),
+  listImportGovernanceAudits: (params: { database_id?: number; field_key?: string; source_kind?: string; q?: string; offset?: number; limit?: number } = {}): Promise<{ total: number; offset: number; limit: number; items: ImportFieldGovernanceAudit[] }> =>
+    api.get('/import/governance/audits', { params }),
   decideObservation: (
     observationId: number,
     request: {
@@ -896,6 +923,7 @@ export const collaborationSyncApi = {
   revokeTrustedDevice: (fingerprint: string): Promise<{ fingerprint: string; revoked: boolean }> => api.delete(`/collaboration-sync/devices/trusted/${encodeURIComponent(fingerprint)}`),
   createAccount: (data: { username: string; password: string; display_name: string; role: string; unit_id?: number; employee_no?: string }): Promise<CollaborationIdentity> => api.post('/collaboration-sync/accounts', data),
   setAccountActive: (userId: number, active: boolean): Promise<{ user_id: number; active: boolean }> => api.patch(`/collaboration-sync/accounts/${userId}/active`, { active }),
+  deleteAccount: (userId: number): Promise<{ success: boolean }> => api.delete(`/collaboration-sync/accounts/${userId}`),
   setAccountRole: (userId: number, role: string, unitId?: number): Promise<CollaborationIdentity> => api.patch(`/collaboration-sync/accounts/${userId}/role`, { role, unit_id: unitId }),
   units: (): Promise<Array<{ id: number; name: string; unit_type: string; team_type?: string | null; parent_id?: number | null }>> => api.get('/collaboration-sync/organization/units'),
   responsibilities: (): Promise<{ items: Array<Record<string, unknown>> }> => api.get('/collaboration-sync/organization/responsibilities'),
@@ -921,7 +949,7 @@ export const collaborationSyncApi = {
     return api.post('/collaboration-sync/accounts/provision/file', data)
   },
   previewAggregationBatch: (batchUid: string): Promise<Record<string, unknown>> => api.post(`/collaboration-sync/aggregation-batches/${encodeURIComponent(batchUid)}/preview`, {}),
-  submitAggregationBatch: (batchUid: string, data: { edit_password?: string; decisions?: Array<{ entity_uid: string; field_key: string; package_uid?: string; choice: 'local' | 'remote' | 'manual'; value?: unknown; reason?: string }> }): Promise<Record<string, unknown>> => api.post(`/collaboration-sync/aggregation-batches/${encodeURIComponent(batchUid)}/submit`, data),
+  submitAggregationBatch: (batchUid: string, data: { edit_password?: string; decisions?: Array<{ entity_uid: string; field_key: string; package_uid?: string; choice: 'local' | 'remote' | 'manual' | 'merge'; value?: unknown; reason?: string }> }): Promise<Record<string, unknown>> => api.post(`/collaboration-sync/aggregation-batches/${encodeURIComponent(batchUid)}/submit`, data),
   publishAggregationBatch: (batchUid: string, data: { recipient_names: string[]; password: string; fields?: string[]; expires_days?: number }): Promise<Record<string, unknown>> => api.post(`/collaboration-sync/aggregation-batches/${encodeURIComponent(batchUid)}/publish`, data),
   inspect: (file: File, password: string): Promise<{ count: number; sample: unknown[]; manifest: Record<string, unknown> }> => {
     const body = new FormData(); body.append('file', file); body.append('password', password)
@@ -932,8 +960,10 @@ export const collaborationSyncApi = {
     return api.post('/collaboration-sync/packages/import', body)
   },
   listPackages: (): Promise<{ items: CollaborationPackage[] }> => api.get('/collaboration-sync/packages'),
+  listGovernanceConflicts: (params: { database_id?: number; status?: 'pending' | 'resolved'; q?: string; field_key?: string; offset?: number; limit?: number }): Promise<{ items: SyncGovernanceConflict[]; total: number; status: string }> =>
+    api.get('/collaboration-sync/conflicts', { params }),
   records: (packageUid: string): Promise<{ items: unknown[] }> => api.get(`/collaboration-sync/packages/${encodeURIComponent(packageUid)}/records`),
   previewApply: (packageUid: string, data: { database_id: number; edit_password?: string; decisions?: Array<{ entity_uid: string; field_key: string; choice: 'local' | 'remote' }> }): Promise<{ create_count: number; update_count: number; unchanged_count: number; conflicts: Array<Record<string, unknown>> }> => api.post(`/collaboration-sync/packages/${encodeURIComponent(packageUid)}/preview-apply`, data),
-  apply: (packageUid: string, data: { database_id: number; edit_password?: string; decisions?: Array<{ entity_uid: string; field_key: string; choice: 'local' | 'remote' }> }): Promise<{ status: string; created: number; updated: number; unchanged: number; pending_conflicts: number; backup_path: string | null; conflicts: Array<Record<string, unknown>> }> => api.post(`/collaboration-sync/packages/${encodeURIComponent(packageUid)}/apply`, data),
+  apply: (packageUid: string, data: { database_id: number; edit_password?: string; source_database_uid?: string; decisions?: Array<{ entity_uid: string; field_key: string; choice: 'local' | 'remote' | 'manual' | 'merge'; value?: JsonValue; reason?: string }> }): Promise<{ status: string; created: number; updated: number; unchanged: number; pending_conflicts: number; backup_path: string | null; conflicts: Array<Record<string, unknown>> }> => api.post(`/collaboration-sync/packages/${encodeURIComponent(packageUid)}/apply`, data),
   download: (packageUid: string): Promise<Blob> => api.get(`/collaboration-sync/packages/${encodeURIComponent(packageUid)}/download`, { responseType: 'blob' }),
 }

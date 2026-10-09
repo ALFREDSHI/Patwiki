@@ -16,6 +16,11 @@ export interface FormulaConfig {
 }
 
 export interface Patent {
+  publication_versions?: Record<string, { kind: 'grant' | 'publication'; fields: Partial<Patent>; source?: string; data_available?: boolean }>
+  document_number?: string
+  document_kind?: 'grant' | 'publication'
+  row_key?: string
+  version_data_available?: boolean
   id: number
   application_number?: string
   publication_number?: string
@@ -225,6 +230,7 @@ export interface PatentGraphResponse {
 
 // 库（PatentDatabase）类型
 export interface PatentDatabase {
+  browsing_config?: BrowsingConfig
   id: number
   name: string
   code?: string
@@ -913,6 +919,7 @@ export interface SemanticProvider {
   credential_ref?: string | null
   config_json: JsonObject
   enabled: boolean
+  has_api_key?: boolean
   last_health_status?: string | null
   last_health_at?: string | null
   last_error_code?: string | null
@@ -1028,7 +1035,7 @@ export interface SemanticEvaluationRun {
   completed_at?: string | null
 }
 
-export type ImportReviewAction = 'adopt' | 'keep_existing' | 'fill_empty' | 'ignore' | 'quarantine'
+export type ImportReviewAction = 'adopt' | 'keep_existing' | 'fill_empty' | 'merge' | 'ignore' | 'quarantine'
 
 export interface ImportChangeReview {
   id: number
@@ -1109,6 +1116,37 @@ export interface GovernanceBatch {
   reversed: boolean
   reversal_reason?: string | null
   reversed_at?: string | null
+}
+
+export interface BrowsingConfig {
+  application_mode: 'merged' | 'separate'
+  preferred_version: 'grant' | 'publication'
+  family_representative: boolean
+  country_order: string[]
+  representative_date: 'earliest' | 'latest'
+}
+
+export interface ImportFieldGovernanceAudit {
+  id: number
+  patent_id?: number | null
+  patent_uid?: string | null
+  patent_title?: string | null
+  application_number?: string | null
+  publication_number?: string | null
+  field_key: string
+  old_value: JsonValue
+  incoming_value: JsonValue
+  final_value: JsonValue
+  source_kind: string
+  source_label?: string | null
+  source_reference?: string | null
+  import_batch_id?: number | null
+  source_row?: number | null
+  source_field_name?: string | null
+  resolution: string
+  decided_by?: string | null
+  reason?: string | null
+  created_at?: string | null
 }
 
 export interface Stats {
@@ -1201,6 +1239,12 @@ export interface FieldMeta {
   frozen?: boolean
   visible?: boolean
   is_system?: boolean
+  value_source?: 'system' | 'manual'
+  value_stability?: 'fixed' | 'variable'
+  merge_policy?: 'version_latest' | 'keep_existing' | 'fill_empty' | 'quarantine'
+  validation_rules?: { required?: boolean; max_length?: number; minimum?: number; maximum?: number }
+  versioned?: boolean
+  is_temporary?: boolean
   ai_config?: AIConfig | null
   formula_config?: FormulaConfig | null
   is_formula?: boolean
@@ -1327,6 +1371,7 @@ export interface McpToolInfo {
   name: string
   description?: string
   inputSchema?: JsonObject
+  mappable_fields?: string[]
 }
 
 export interface SyncSubscription {
@@ -1364,6 +1409,25 @@ export interface SyncRun {
   retry_count: number
   started_at?: string | null
   finished_at?: string | null
+  created_at?: string | null
+}
+
+export interface SyncRecord {
+  id: number
+  sync_run_id: number
+  external_record_id: string
+  record_kind: string
+  patent_id?: number | null
+  patent_number?: string | null
+  patent_title?: string | null
+  external_snapshot_id?: number | null
+  identity_status: string
+  identity_candidate_patent_ids: number[]
+  outcome: string
+  idempotency_key: string
+  error_code?: string | null
+  error_message?: string | null
+  snapshot_payload?: JsonValue
   created_at?: string | null
 }
 
@@ -1525,6 +1589,52 @@ export interface CollaborationPackage {
   created_at?: string | null
   signature_status?: string
   signer_fingerprint?: string | null
+}
+
+export interface FieldVersions {
+  field: FieldMeta
+  current_value: string | null
+  versions: { id: number; old_value: string | null; value: string | null; source: string; source_label?: string; source_row?: number; import_batch_id?: number; created_at?: string }[]
+  imports: { id: number; value: string | null; decision?: string; batch_id: number | null; filename: string; status: string; created_at?: string }[]
+}
+
+export interface ImportDraft {
+  database_id: number
+  mapping: Record<string, string>
+  selected_sheet?: string | null
+  product_id?: number | null
+  project_id?: number | null
+  view_id?: number | null
+  import_note: string
+}
+
+export interface SyncGovernanceConflict {
+  conflict_uid: string
+  package_uid: string
+  package_status: string
+  status: 'pending' | 'resolved'
+  entity_uid: string
+  field_key: string
+  base_value?: JsonValue | null
+  local_value?: JsonValue | null
+  current_local_value?: JsonValue | null
+  current_local_value_available: boolean
+  remote_value?: JsonValue | null
+  decision?: string | null
+  final_value?: JsonValue | null
+  decision_reason?: string | null
+  decided_at?: string | null
+  created_at?: string | null
+  target_database_id: number
+  target_database_name: string
+  source_database_uid?: string | null
+  source_database_name?: string | null
+  source_database_options: Array<{ database_uid: string; name: string }>
+  patent_id?: number | null
+  patent_title?: string | null
+  application_number?: string | null
+  publication_number?: string | null
+  grant_number?: string | null
 }
 
 export interface DatabaseMember {

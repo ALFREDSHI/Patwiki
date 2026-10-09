@@ -1,3 +1,4 @@
+import TableDropdownOverlay from '../common/TableDropdown'
 import { useState, useMemo } from 'react'
 import { aiApi } from '../../api'
 import type { AITask, CustomField, FieldMeta } from '../../types'
@@ -99,8 +100,11 @@ export default function AIQuickAnalyzeModal({
   const allWritableFields = useMemo(() => {
     // AI 草稿只能写入已注册的自定义字段；系统事实字段仍需人工确认，
     // 避免快速抽取绕过来源和字段类型治理。
-    return customFields.filter(f => !['formula', 'attachment', 'link', 'lookup', 'rollup'].includes(f.field_type))
-  }, [customFields])
+    const systemFields = fields
+      .filter(f => ['technical_problem', 'technical_solution', 'technical_effect'].includes(f.key))
+      .map(f => ({ ...f, id: -Math.abs(f.key.length), field_type: 'textarea' as const }))
+    return [...systemFields, ...customFields.filter(f => !['formula', 'attachment', 'link', 'lookup', 'rollup'].includes(f.field_type))]
+  }, [customFields, fields])
 
   const toggleInput = (key: string) => {
     setSelectedInputs(prev => {
@@ -221,7 +225,7 @@ export default function AIQuickAnalyzeModal({
   }
 
   return (
-    <div
+    <TableDropdownOverlay onClose={onClose} width={760}
       style={{
         position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
         background: 'rgba(0,0,0,0.45)', display: 'flex',
@@ -480,6 +484,6 @@ export default function AIQuickAnalyzeModal({
           </button>
         </div>
       </div>
-    </div>
+    </TableDropdownOverlay>
   )
 }

@@ -80,6 +80,7 @@ class PatentRefreshRequest(BaseModel):
     identifier: str = Field(min_length=1, max_length=300)
     database_id: int | None = None
     review_policy: str = "safe_auto_apply"
+    fields: list[str] | None = None
 
 
 class ObservationDecisionRequest(BaseModel):
@@ -97,6 +98,15 @@ class SyncUpdatePreviewRequest(BaseModel):
     connector_id: int
     database_id: int
     patent_ids: list[int] = Field(min_length=1, max_length=500)
+    fields: list[str] | None = None
+
+
+class McpToolMapPreviewRequest(BaseModel):
+    database_id: int
+    patent_id: int
+    service: str = Field(min_length=1, max_length=150)
+    tool: str = Field(min_length=1, max_length=150)
+    arguments: dict[str, Any] = Field(default_factory=dict)
     fields: list[str] | None = None
 
 

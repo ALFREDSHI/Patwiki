@@ -4,6 +4,8 @@ import { useAppStore } from '../../store'
 import type { Page } from '../../App'
 import type { PatentDatabase } from '../../types'
 import Icon, { type IconName } from '../common/Icon'
+import BrandLogo from '../common/BrandLogo'
+import { UserAgreementLink } from '../common/LegalFooter'
 
 const SIDEBAR_SECTIONS_STORAGE_KEY = 'patwiki_sidebar_sections'
 type SidebarSectionKey = 'workspace' | 'intelligence' | 'management'
@@ -54,7 +56,6 @@ const NAV_SECTIONS: Array<{ key: SidebarSectionKey; label: string; items: NavDes
     label: '系统管理',
     items: [
       { page: 'management', label: '业务管理台', icon: 'dashboard', hint: '字段、模板与业务规则配置' },
-      { page: 'fields', label: '自定义字段', icon: 'settings', hint: '新增、编辑、停用和删除已有自定义字段' },
       { page: 'attachments', label: '附件库', icon: 'file', hint: '统一查找专利与项目附件' },
       { page: 'sharing', label: '协作与权限', icon: 'users', hint: '成员、角色与权限管理' },
     ],
@@ -216,10 +217,10 @@ export default function Sidebar({ currentPage, onNavigate, collapsed, onToggleCo
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
-        <div className="brand-mark">PW</div>
+        <div className="brand-mark" title="PatWiki · 专利知识工作台"><BrandLogo size={34} /></div>
         <div>
-          <h1>PatWiki</h1>
-          <p>专利知识工作台</p>
+          <h1>patwiki</h1>
+          <p>PATENT KNOWLEDGE WORKSPACE</p>
         </div>
         <button
           type="button"
@@ -307,6 +308,7 @@ export default function Sidebar({ currentPage, onNavigate, collapsed, onToggleCo
         ))}
       </nav>
 
+      <UserAgreementLink />
       <button className="sidebar-account" onClick={() => onNavigate('sharing', currentDatabaseId)} title="管理协作与权限">
         <div className={`account-avatar ${currentUser ? '' : 'muted'}`}>
           {currentUser ? (currentUser.display_name || currentUser.username).charAt(0).toUpperCase() : '?'}

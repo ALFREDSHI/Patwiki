@@ -14,7 +14,25 @@ SAFE_EXTERNAL_FIELDS = {
     "applicant", "inventor", "assignee", "agent", "filing_date", "publication_date",
     "grant_date", "priority_date", "priority_number", "priority_country", "country",
     "ipc_main", "ipc_all", "cpc_main", "cpc_all",
+    "claims", "description_full",
 }
+
+REVIEWABLE_EXTERNAL_FIELDS = SAFE_EXTERNAL_FIELDS | {"technical_problem", "technical_solution", "technical_effect", "legal_status_details"}
+
+# HimmPat dossier enrichments are stored as auditable JSON projections in
+# Patent.custom_fields.  They are intentionally enumerated so an arbitrary
+# provider payload can never become a writable patent field.
+MCP_CUSTOM_FIELDS = {
+    "mcp_record_fields", "mcp_priority_claims", "mcp_classification_details", "mcp_party_details",
+    "mcp_claim_metadata", "mcp_description_metadata", "mcp_family_members", "mcp_citation_data",
+    "mcp_cited_patents", "mcp_legal_event_details", "mcp_reexamination", "mcp_invalidation",
+    "mcp_transfer_events", "mcp_license_events", "mcp_pledge_events", "mcp_preservation_events",
+    "mcp_value_evaluation", "mcp_technology_value", "mcp_legal_value", "mcp_market_value",
+    "mcp_strategic_value", "mcp_pdf_original", "mcp_abstract_figure", "mcp_description_figures",
+}
+
+EXTERNAL_RELATION_FIELDS = {"family_members", "cited_patents", "citing_patents"}
+REVIEWABLE_EXTERNAL_FIELDS = REVIEWABLE_EXTERNAL_FIELDS | MCP_CUSTOM_FIELDS | EXTERNAL_RELATION_FIELDS
 
 LEGAL_STATUS_MAP = {
     "pending": "pending", "published": "published", "examining": "examining",
